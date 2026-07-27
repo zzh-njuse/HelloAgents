@@ -1,6 +1,6 @@
 # Self-host 学习平台开发路线
 
-版本日期：2026-07-13
+版本日期：2026-07-27
 
 状态：当前执行路线
 
@@ -15,18 +15,20 @@
 
 ## 2. 当前状态
 
-当前状态：**Platform Stage 3 已完成。Platform Stage 4 Slice 1 的课节练习、整份交卷、确定性单选评分、rubric 约束简答反馈、独立 practice worker、OCR/eval 与人工 Chrome 主路径 Gate 已完成；当前进入 Slice 2 掌握度、复习队列与可管理 Memory 的 Spec/ADR 分析，尚未批准 Slice 2 实现**。
+当前状态：**Platform Stage 4 Slice 1/2/3/4/5 已完成并于 2026-07-24 归档。
+Platform Stage 5 顶层方向已通过人工 Gate，Slice 1A 已于 2026-07-27 完成实现、
+独立验收、浏览器 smoke 和 OCR；Slice 1B/1C 尚未批准**。
 
 已经完成：
 
-- 0R 基线重建、Stage 1 self-host 平台壳、Stage 2 单文件/批量资料生命周期、引用检索与受证据约束的单轮回答。
+- 0R 基线重建、Stage 1 self-host 平台壳、Stage 2 资料生命周期、Stage 3 章节与 Tutor，以及 Stage 4 练习、掌握度、Memory、教学 Skill、受控代码/Wolfram 工具和练习稳定化。
 - Postgres 事实源、Qdrant 可重建索引、Redis 非权威队列的产品合同已落实。
-- Stage 2 OCR 审查、focused tests、Web build、Compose 和人工验收反馈已归档。
+- Stage 4 自动化、离线 eval、Web build、分块 OCR 和人工浏览器 smoke 已归档。
 
 下一步：
 
-- Stage 3 已完成；Tutor Session 已产品化，但短期 history 不等于长期 Memory。Stage 4 Slice 1 已提供可追溯 Attempt/Feedback，但这些事实仍不能自动升级为掌握度或长期 Memory。
-- Stage 2 收尾结论和继承边界见 [Stage 2 总结与 Stage 3 输入](./02-platform-stage-2-material-lifecycle-and-citation-retrieval/STAGE_2_SUMMARY_AND_STAGE_3_INPUTS.md)。
+- Stage 5 先建立最小观测事实和代表性系统测试，再根据证据优化 Tutor、练习、编程链路和课节交互。
+- Stage 5 顶层输入和范围见 [Stage 5 文档入口](./05-platform-stage-5-observability-system-validation-and-quality/README.md)。
 
 ## 3. Platform Stage 0R：基线重建
 
@@ -187,25 +189,34 @@ Office、图片 OCR、网页/Git 导入和更广泛 parser 不属于已确认的
 - memory 不以隐藏文件作为唯一事实来源。
 - 用户可以理解系统为什么推荐某项复习。
 
-## 8. Platform Stage 5：质量、成本与部署加固
+## 8. Platform Stage 5：可观测、系统验证与质量优化
 
 ### 用户价值
 
-平台运行质量、成本和风险可见，self-host 部署具备更可信的维护方式。
+平台运行质量、失败原因和成本可见；关键学习主路径能够被系统测试重复验证，
+并据此改善 Tutor、练习、编程链路和课节交互。
 
 ### 建议范围
 
-- agent run、tool call、eval、latency 和 cost dashboard。
-- provider budget、timeout、retry、cache 和 circuit breaker 策略。
-- Postgres backup/restore、Qdrant rebuild 和 storage reconciliation。
-- Redis/Qdrant auth、容器非 root、端口和反向代理 hardening。
-- CI、集成测试和发布文档。
+- 可观测与成本：统一安全的 run/tool/job/eval、失败分类、latency、usage 和成本口径。
+- CI 与系统测试：建立跨 Web、API、worker、Postgres 和必要 adapter 的代表性纵向验证。
+- 最终优化：根据观测和系统测试证据，改善 Tutor、普通/科学/编程练习及课节交互。
+- 三部分分别拆成小 Slice；一个 Slice 默认只承担一个主要风险轴。
+- 成本展示统一使用人民币，不建设多币种、实时汇率、折扣、套餐或账单系统。
+
+### 明确暂缓
+
+- Postgres backup/restore、Qdrant rebuild runbook 和 storage reconciliation。
+- Redis/Qdrant auth、容器非 root、端口、反向代理和 HTTPS hardening。
+- 上述事项顺延至后续部署加固阶段，不视为取消或已经解决。
 
 ### 完成 Gate
 
-- 质量与成本指标来自真实 trace/eval。
-- 权威数据可备份，派生索引可重建。
-- 部署风险与默认暴露范围有明确说明。
+- 质量与成本指标来自真实 trace/eval，并具有脱敏、归因和失败分类合同。
+- 至少一条代表性学习主路径可跨 Web、API、worker、数据库和 adapter 重复运行。
+- Tutor、普通练习和编程练习具有固定小样本质量基线，不以单次成功代替稳定证据。
+- 优化项关联可复现问题、前后基线和回归结果；自动化、环境、真实 provider 和浏览器 Gate 分层报告。
+- 备份恢复与部署安全暂缓风险在阶段总结和后续路线中保持可追踪。
 
 ## 9. Agent 基础能力演进大纲
 
@@ -220,7 +231,11 @@ Office、图片 OCR、网页/Git 导入和更广泛 parser 不属于已确认的
 | 多 Agent | Course Architect、Lesson Writer、Tutor 的角色候选 | 只在职责和 artifact 真正可分时建立结构化交接 | 编排所有权、独立重试/取消、部分成功、人工 Gate 与成本放大 |
 | Memory | 现有本地 memory 原型，但无产品事实合同 | 先区分当前 session/context，再基于学习事件、掌握度和复习形成长期 memory | 写入/提升规则、来源、纠正、删除、过期、冲突和效果 eval |
 
-候选的整体节奏是：Stage 3 首次落地受控 Agent、RAG tool 和最小追踪；Stage 4 将学习事件、掌握度、练习/复习和可管理 memory 形成闭环；Stage 5 统一 eval、运行轨迹、成本和部署治理。Skill、MCP 和多 Agent 的确切引入时点不在本大纲中提前锁定。
+候选的整体节奏是：Stage 3 首次落地受控 Agent、RAG tool 和最小追踪；
+Stage 4 将学习事件、掌握度、练习/复习和可管理 memory 形成闭环；Stage 5
+统一 eval、运行轨迹和成本，并用系统测试驱动质量优化。备份恢复与部署安全
+治理顺延到后续部署加固阶段。Skill、MCP 和多 Agent 的确切引入时点不在本
+大纲中提前锁定。
 
 ## 10. 阶段依赖
 
@@ -230,7 +245,7 @@ Stage 0R 基线
   -> Stage 2 资料生命周期
   -> Stage 3 章节与 Tutor
   -> Stage 4 练习与记忆
-  -> Stage 5 质量与加固
+  -> Stage 5 可观测、系统验证与质量优化
 ```
 
 后续 Stage 可以做设计预研，但不能绕过前一阶段的数据合同和验证 Gate 开始大规模实现。

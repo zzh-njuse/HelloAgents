@@ -1,6 +1,6 @@
 # HelloAgents 学习平台蓝图
 
-版本日期：2026-07-12
+版本日期：2026-07-27
 
 状态：当前产品指导文档
 
@@ -199,7 +199,10 @@ RAG、Memory、Skill、MCP 和多 Agent 不是为了展示 framework 而并列�
 | MCP | 在白名单、来源、超时和用户授权边界内接入外部资料/工具 | 为了“工具化”绕过产品 API 和权限 |
 | 多 Agent | 在责任可分、产物可验证时，通过结构化 artifact 交接的工作流 | 多个角色自由聊天或重复调用同一模型 |
 
-第一个真正的产品 Agent 上线时，必须同时具备最小可审计的 run/tool 追踪；Stage 5 负责统一 dashboard、成本与运维治理，不能把 Agent 正确性所必需的追踪整体推迟到 Stage 5。
+第一个真正的产品 Agent 上线时，必须同时具备最小可审计的 run/tool 追踪；
+Stage 5 负责统一质量/成本视图、系统验证和基于证据的优化，不能把 Agent
+正确性所必需的追踪整体推迟到 Stage 5。备份恢复与部署安全治理顺延到后续
+部署加固阶段。
 
 ## 8. 产品数据原则
 
@@ -214,11 +217,15 @@ RAG、Memory、Skill、MCP 和多 Agent 不是为了展示 framework 而并列�
 
 ## 9. 当前产品起点
 
-已完成 0R 基线重建、Stage 1 self-host 平台壳、Stage 2 资料生命周期，以及 Stage 3 的版本化课程、受控生成、Course Reader、Tutor、Workspace 删除、固定 eval 和脱敏运行摘要。Stage 4 进入练习、掌握度、复习队列和可管理长期 Memory 的事实盘点与 Spec/ADR 分析准备，尚未批准实现。
+已完成 0R 基线重建、Stage 1 self-host 平台壳、Stage 2 资料生命周期、Stage 3
+版本化课程与 Tutor，以及 Stage 4 的练习、掌握度、复习、可管理 Memory、教学
+Skill、受控代码/Wolfram 工具和练习稳定化。Stage 5 可观测、系统验证与质量
+优化的顶层方向已经通过人工 Gate；Slice 1A 的运行摘要合同已完成实现、独立验收、
+浏览器 smoke 和 OCR。Slice 1B/1C 尚未批准。
 
 - 产品 `apps/api`、`apps/web`、Postgres migration、Compose、worker 和资料索引链路已建立。
-- Stage 2 的 `document/version/chunk/job/citation` 合同可作为 Stage 3 的课程和 Tutor 证据基础，不可被新 Agent 逻辑绕过。
-- 误仓库的高层行为模式仍只是参考；Stage 3 需以正确仓库的 Spec/ADR 和人工 Gate 为准。
+- Stage 2 至 Stage 4 的资料、课程、Tutor、练习、Memory、trace 和工具边界继续有效，不可由 Stage 5 优化逻辑绕过。
+- Stage 5 先用真实运行事实和纵向系统测试建立质量基线，再修复 Tutor、练习、编程链路和课节交互。
 
 ## 10. 成功标准
 

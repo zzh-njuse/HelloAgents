@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel
 
@@ -10,8 +11,8 @@ class AgentRunIdentity(BaseModel):
     show. Never carries prompts, answers, evidence, draft content or any path.
     """
 
-    # "course_generation" when linked to a CourseGenerationJob, "tutor" when linked to a TutorTurn.
-    kind: str
+    # "course_generation" | "tutor" | "practice" | "code_execution" | "unknown"
+    kind: Literal["course_generation", "tutor", "practice", "code_execution", "unknown"]
     # Course generation task type, e.g. "course_outline" / "lesson_draft". None for tutor runs.
     job_type: str | None = None
     course_id: str | None = None
@@ -22,6 +23,9 @@ class AgentRunIdentity(BaseModel):
     lesson_title: str | None = None
     # Tutor turn scope ("lesson" / "course"). None for course generation runs.
     tutor_scope: str | None = None
+    # Code Lab language: "python" | "java" | "cpp" | null.
+    # Abnormal historical values are not surfaced and return null.
+    code_language: Literal["python", "java", "cpp"] | None = None
 
 
 class AgentToolCallRead(BaseModel):

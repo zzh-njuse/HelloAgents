@@ -1,12 +1,17 @@
 # 数据库与部署计划
 
-版本日期：2026-07-16
+版本日期：2026-07-27
 
 状态：当前架构指导文档
 
 ## 1. 当前事实
 
-正确仓库已经建立 `apps/api`、`apps/web`、Postgres、Redis、Qdrant、Alembic、worker/reconciler 和 Docker Compose 产品层。Platform Stage 2 已完成；Stage 3 Slice 1/2 已建立版本化课程、受控生成、Tutor、Workspace 删除和 `agent_runs/agent_tool_calls` 最小审计事实。Slice 3 只在现有表上增加脱敏只读投影与离线 eval，不新增 eval 表或 migration。
+正确仓库已经建立 `apps/api`、`apps/web`、Postgres、Redis、Qdrant、Alembic、
+worker/reconciler 和 Docker Compose 产品层。Platform Stage 4 已完成；课程、
+Tutor、练习、掌握度、Memory、受控工具和异步任务均已有 Postgres 权威事实，
+并保留 `agent_runs/agent_tool_calls` 最小审计记录。Stage 5 可观测、系统验证与
+质量优化的顶层方向已经通过人工 Gate，尚未批准新增 eval/cost schema 或
+migration。成本展示统一使用人民币，不建设多币种或实时汇率系统。
 
 Framework/domain 仍可复用的既有存储能力：
 
@@ -133,7 +138,10 @@ lesson_versions
 lesson_citations
 ```
 
-Stage 3 一旦引入真正的 Tutor 或生成 Agent，必须同时保留最小可审计的 run/tool 记录。具体是扩展现有 trace，还是提前建立受限的 `agent_runs/tool_calls`，由 Stage 3 ADR 决定。Stage 5 的目标是统一治理、展示、成本与运维加固，不是等到 Stage 5 才第一次记录 Agent 运行事实。
+Stage 3 一旦引入真正的 Tutor 或生成 Agent，必须同时保留最小可审计的
+run/tool 记录。当前已经采用受限的 `agent_runs/agent_tool_calls`。Stage 5 的
+目标是统一质量与成本治理、系统验证和基于证据的优化，不是等到 Stage 5 才
+第一次记录 Agent 运行事实。
 
 ### Stage 4：练习与记忆
 
@@ -148,17 +156,19 @@ review_items
 memories
 ```
 
-### Stage 5：质量与成本
+### Stage 5：可观测与成本候选数据
 
 ```text
-agent_runs
-tool_calls
+agent_runs（已有）
+agent_tool_calls（已有）
 eval_cases
 eval_results
 cost_events
 ```
 
-表名和字段只在对应 Stage spec/ADR 中成为正式合同。
+`eval_cases`、`eval_results` 和 `cost_events` 仍是候选；是否建表、复用离线
+fixture，或采用聚合投影，必须先完成 Stage 5 事实盘点并由对应 Spec/ADR 决定。
+不得为了 dashboard 预先创建 schema。
 
 ## 5. Existing assets 的处理
 
@@ -237,11 +247,14 @@ Stage 2 增加 `worker`。Stage 1 不加入 Neo4j、MinIO、反向代理或 HTTP
 - readiness 只返回组件是否可用，不返回内部 URL、绝对路径或凭据。
 - API 日志不记录上传全文、完整 prompt、API key 或 provider 原始错误正文。
 - 用户资源即使第一版单用户，也保留 workspace 外键和 filter 纪律。
-- 默认端口暴露、Redis/Qdrant auth、容器非 root 和 HTTPS 在 Stage 5 加固；Stage 1 文档必须明确本地开发边界。
+- 默认端口暴露、Redis/Qdrant auth、容器非 root 和 HTTPS 顺延到后续部署加固
+  阶段；现有文档必须继续明确本地开发边界，不能把暂缓写成已经安全。
 
 ## 11. 备份与恢复目标
 
-权威备份至少包含 Postgres dump、storage volume 和非敏感配置模板。Qdrant 和 Redis 不作为唯一恢复来源。Stage 5 提供索引重建 runbook。
+权威备份至少包含 Postgres dump、storage volume 和非敏感配置模板。Qdrant 和
+Redis 不作为唯一恢复来源。备份恢复、索引重建 runbook 和 storage
+reconciliation 顺延到后续部署加固阶段。
 
 ## 12. 实施顺序
 

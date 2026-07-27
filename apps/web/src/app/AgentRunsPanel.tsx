@@ -18,7 +18,11 @@ type LoadState = "loading" | "ready" | "error";
 const ROLE_LABEL: Record<AgentRunRole, string> = {
   course_architect: "课程架构",
   lesson_writer: "课节撰写",
-  tutor: "辅导"
+  tutor: "辅导",
+  exercise_author: "练习生成",
+  answer_grader: "练习评分",
+  scientific_solution_grader: "科学题验证",
+  code_execution: "代码执行",
 };
 
 const STATUS_LABEL: Record<AgentRunStatus, string> = {
@@ -26,6 +30,16 @@ const STATUS_LABEL: Record<AgentRunStatus, string> = {
   succeeded: "成功",
   failed: "失败",
   canceled: "已取消"
+};
+
+const COURSE_JOB_LABEL: Record<string, string> = {
+  course_outline: "课程大纲",
+  lesson_draft: "课节草稿"
+};
+
+const PRACTICE_JOB_LABEL: Record<string, string> = {
+  generate_set: "练习生成",
+  grade_attempt: "练习评分"
 };
 
 // Only stable, non-sensitive short descriptions. Never surfaces server logs,
@@ -53,6 +67,14 @@ const TOOL_LABEL: Record<string, string> = {
 
 const RUNS_LOAD_ERROR = "运行记录读取失败，请稍后重试";
 const DETAIL_LOAD_ERROR = "运行阶段读取失败，请稍后重试";
+const isKnownRole = (role: string): role is AgentRunRole =>
+  Object.prototype.hasOwnProperty.call(ROLE_LABEL, role);
+const isKnownStatus = (status: string): status is AgentRunStatus =>
+  Object.prototype.hasOwnProperty.call(STATUS_LABEL, status);
+const safeRoleLabel = (role: string): string => {
+  if (isKnownRole(role)) return ROLE_LABEL[role];
+  return "其他运行";
+};
 const safeErrorText = (code: string | null): string | null => {
   if (!code) return null;
   return ERROR_LABEL[code] ?? "运行出现问题";
@@ -63,25 +85,43 @@ const isRunning = (status: string) => status === "running";
 function identityLabel(run: AgentRunSummary): string {
   const identity = run.identity;
   if (identity.course_deleted) return "已删除对象";
-  if (identity.kind === "course_generation") {
-    const jobType = identity.job_type === "course_outline" ? "课程大纲" : identity.job_type === "lesson_draft" ? "课节草稿" : "课程生成";
-    const parts = [jobType, identity.course_title, identity.lesson_title].filter(Boolean) as string[];
-    return parts.length ? parts.join(" · ") : "课程生成";
+  switch (identity.kind) {
+    case "course_generation": {
+      const jobType = identity.job_type ? COURSE_JOB_LABEL[identity.job_type] ?? "课程生成" : "课程生成";
+      const parts = [jobType, identity.course_title, identity.lesson_title].filter(Boolean) as string[];
+      return parts.length ? parts.join(" · ") : "课程生成";
+    }
+    case "tutor": {
+      const scope = identity.tutor_scope === "lesson" ? "本课辅导" : "本课程辅导";
+      const parts = [scope, identity.course_title, identity.lesson_title].filter(Boolean) as string[];
+      return parts.length ? parts.join(" · ") : "辅导";
+    }
+    case "practice": {
+      const jobType = identity.job_type ? PRACTICE_JOB_LABEL[identity.job_type] ?? "练习" : "练习";
+      const parts = [jobType, identity.course_title, identity.lesson_title].filter(Boolean) as string[];
+      return parts.length ? parts.join(" · ") : "练习";
+    }
+    case "code_execution": {
+      const lang = identity.code_language ?? "";
+      const parts = ["代码执行", lang, identity.course_title, identity.lesson_title].filter(Boolean) as string[];
+      return parts.length ? parts.join(" · ") : "代码执行";
+    }
+    case "unknown":
+      return "其他运行";
+    default:
+      return "其他运行";
   }
-  const scope = identity.tutor_scope === "lesson" ? "本课辅导" : "本课程辅导";
-  const parts = [scope, identity.course_title, identity.lesson_title].filter(Boolean) as string[];
-  return parts.length ? parts.join(" · ") : "辅导";
 }
 
 function tokenLabel(run: AgentRunSummary): string {
-  if (run.input_tokens == null && run.output_tokens == null) return "token 未报告";
-  const input = run.input_tokens == null ? "?" : String(run.input_tokens);
-  const output = run.output_tokens == null ? "?" : String(run.output_tokens);
+  if (run.input_tokens === null && run.output_tokens === null) return "token 未报告";
+  const input = run.input_tokens === null ? "?" : String(run.input_tokens);
+  const output = run.output_tokens === null ? "?" : String(run.output_tokens);
   return `入 ${input} / 出 ${output}`;
 }
 
 function durationLabel(run: AgentRunSummary): string {
-  if (run.duration_seconds != null) return `${run.duration_seconds.toFixed(1)} s`;
+  if (run.duration_seconds !== null) return `${run.duration_seconds.toFixed(1)} s`;
   if (isRunning(run.status)) return "进行中";
   return "—";
 }
@@ -107,22 +147,32 @@ export function AgentRunsPanel({ workspaceId }: { workspaceId: string }) {
 
   useEffect(() => {
     let cancelled = false;
+    const controller = new AbortController();
     setCourses([]);
     setCoursesError(false);
-    fetchCourses(workspaceId)
+    fetchCourses(workspaceId, controller.signal)
       .then((next) => { if (!cancelled) setCourses(next); })
-      .catch(() => { if (!cancelled) setCoursesError(true); });
-    return () => { cancelled = true; };
+      .catch((err) => {
+        if (err instanceof DOMException && err.name === "AbortError") return;
+        if (!cancelled) setCoursesError(true);
+      });
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
   }, [workspaceId]);
 
   const refresh = useCallback(
     async (signal?: AbortSignal, silent = false) => {
       const request = ++runsRequest.current;
-      if (!silent) setLoadState("loading");
+      if (!silent) {
+        setLoadState("loading");
+        setRuns([]);
+      }
       const query: AgentRunQuery = {};
       if (filterCourse) query.course_id = filterCourse;
-      if (filterRole) query.role = filterRole as AgentRunRole;
-      if (filterStatus) query.status = filterStatus as AgentRunStatus;
+      if (isKnownRole(filterRole)) query.role = filterRole;
+      if (isKnownStatus(filterStatus)) query.status = filterStatus;
       try {
         const next = await fetchAgentRuns(workspaceId, query, signal);
         if (request !== runsRequest.current) return;
@@ -244,6 +294,10 @@ export function AgentRunsPanel({ workspaceId }: { workspaceId: string }) {
             <option value="course_architect">课程架构</option>
             <option value="lesson_writer">课节撰写</option>
             <option value="tutor">辅导</option>
+            <option value="exercise_author">练习生成</option>
+            <option value="answer_grader">练习评分</option>
+            <option value="scientific_solution_grader">科学题验证</option>
+            <option value="code_execution">代码执行</option>
           </select>
         </label>
         <label>
@@ -282,13 +336,13 @@ export function AgentRunsPanel({ workspaceId }: { workspaceId: string }) {
             const errorText = safeErrorText(run.error_code);
             return (
               <li className="run-row" key={run.id}>
-                <button className="run-summary" onClick={() => void toggleRun(run.id)} type="button">
+                <button className="run-summary" onClick={() => void toggleRun(run.id)} type="button" aria-expanded={expanded} aria-controls={`run-detail-${run.id}`}>
                   <span className="run-identity">
                     <span className="run-identity-title">
                       {run.role === "tutor" ? <Activity size={16} /> : <RefreshCw size={16} />}
                       <strong>{identityLabel(run)}</strong>
                     </span>
-                    <small>{ROLE_LABEL[run.role]} · 第 {run.attempt_number} 次</small>
+                    <small>{safeRoleLabel(run.role)} · 第 {run.attempt_number} 次</small>
                   </span>
                   <span className="run-metrics">
                     <small>{tokenLabel(run)}</small>
@@ -299,7 +353,7 @@ export function AgentRunsPanel({ workspaceId }: { workspaceId: string }) {
                   {expanded ? <ChevronDown size={18} /> : <ChevronRight size={18} />}
                 </button>
                 {expanded ? (
-                  <div className="run-detail">
+                  <div className="run-detail" id={`run-detail-${run.id}`}>
                     {errorText ? <p className="run-detail-error">{errorText}</p> : null}
                     {detailError ? <p className="run-detail-error">{detailError}</p> : null}
                     {detail ? (

@@ -11,7 +11,16 @@ from learn_platform_api.services.workspaces import workspace_is_active
 
 router = APIRouter(prefix="/api/v1/workspaces/{workspace_id}", tags=["agent-runs"])
 
-RunRole = Literal["course_architect", "lesson_writer", "tutor"]
+# Stage 5 Slice 1A: seven known roles covering Stage 3 + Stage 4.
+RunRole = Literal[
+    "course_architect",
+    "lesson_writer",
+    "tutor",
+    "exercise_author",
+    "answer_grader",
+    "scientific_solution_grader",
+    "code_execution",
+]
 RunStatus = Literal["running", "succeeded", "failed", "canceled"]
 
 

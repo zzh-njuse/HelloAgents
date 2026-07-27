@@ -4,6 +4,8 @@ from sqlalchemy.orm import Session
 from learn_platform_api.db.models import (
     AgentRun,
     AgentToolCall,
+    CodeLabJob,
+    CodeLabRun,
     Course,
     CourseGenerationJob,
     Lesson,
@@ -14,6 +16,10 @@ from learn_platform_api.db.models import (
     TutorSession,
     TutorTurn,
 )
+
+# Code Lab languages that are safe to surface. Abnormal historical values
+# (e.g. "ruby", "go") are not exposed and return null instead.
+SAFE_CODE_LANGUAGES = {"python", "java", "cpp"}
 
 
 def _duration_seconds(run: AgentRun) -> float | None:
@@ -37,7 +43,7 @@ def _identity(db: Session, run: AgentRun) -> dict[str, object]:
     view can show "已删除" without reviving content.
     """
     identity: dict[str, object] = {
-        "kind": "course_generation",
+        "kind": "unknown",
         "job_type": None,
         "course_id": None,
         "course_title": None,
@@ -45,6 +51,7 @@ def _identity(db: Session, run: AgentRun) -> dict[str, object]:
         "lesson_id": None,
         "lesson_title": None,
         "tutor_scope": None,
+        "code_language": None,
     }
 
     if run.course_generation_job_id is not None:
@@ -141,6 +148,44 @@ def _identity(db: Session, run: AgentRun) -> dict[str, object]:
             identity["course_deleted"] = True
         return identity
 
+    if run.code_lab_job_id is not None:
+        identity["kind"] = "code_execution"
+        job = db.get(CodeLabJob, run.code_lab_job_id)
+        if job is None or job.workspace_id != run.workspace_id:
+            identity["course_deleted"] = True
+            return identity
+        # Read the CodeLabRun for language and optional course/lesson.
+        code_run = db.get(CodeLabRun, job.run_id)
+        if (
+            code_run is not None
+            and code_run.workspace_id == run.workspace_id
+            and code_run.deleted_at is None
+        ):
+            # Only surface known-safe languages. Abnormal historical values
+            # return null rather than being exposed verbatim.
+            if code_run.language in SAFE_CODE_LANGUAGES:
+                identity["code_language"] = code_run.language
+            # Course/Lesson are optional on CodeLabRun.
+            if code_run.course_id:
+                course = db.get(Course, code_run.course_id)
+                if (
+                    course is not None
+                    and course.workspace_id == run.workspace_id
+                    and course.lifecycle_status == "active"
+                ):
+                    identity["course_id"] = course.id
+                    identity["course_title"] = course.title
+                else:
+                    identity["course_deleted"] = True
+            if code_run.lesson_id and not identity["course_deleted"]:
+                lesson = db.get(Lesson, code_run.lesson_id)
+                if lesson is not None and lesson.workspace_id == run.workspace_id:
+                    identity["lesson_id"] = lesson.id
+                    identity["lesson_title"] = lesson.title
+        else:
+            identity["course_deleted"] = True
+        return identity
+
     # No association recorded: nothing identifiable, but still safe to surface.
     identity["course_deleted"] = True
     return identity
@@ -200,19 +245,32 @@ def list_agent_runs(
             PracticeSet.workspace_id == workspace_id, PracticeSet.course_id == course_id
         )
         practice_grade_items = select(PracticeItem.id).where(
-            PracticeItem.practice_set_id.in_(practice_grade_sets)
+            PracticeItem.workspace_id == workspace_id,
+            PracticeItem.practice_set_id.in_(practice_grade_sets),
         )
         practice_grade_attempts = select(PracticeAttempt.id).where(
-            PracticeAttempt.practice_item_id.in_(practice_grade_items)
+            PracticeAttempt.workspace_id == workspace_id,
+            PracticeAttempt.practice_item_id.in_(practice_grade_items),
         )
         practice_grade_jobs = select(PracticeJob.id).where(
+            PracticeJob.workspace_id == workspace_id,
             PracticeJob.practice_attempt_id.in_(practice_grade_attempts)
+        )
+        # Code Lab runs with an associated course_id on the CodeLabRun.
+        code_lab_runs_with_course = select(CodeLabRun.id).where(
+            CodeLabRun.workspace_id == workspace_id,
+            CodeLabRun.course_id == course_id,
+        )
+        code_lab_jobs_with_course = select(CodeLabJob.id).where(
+            CodeLabJob.workspace_id == workspace_id,
+            CodeLabJob.run_id.in_(code_lab_runs_with_course),
         )
         statement = statement.where(
             AgentRun.course_generation_job_id.in_(course_jobs)
             | AgentRun.tutor_turn_id.in_(tutor_turns)
             | AgentRun.practice_job_id.in_(practice_generate)
             | AgentRun.practice_job_id.in_(practice_grade_jobs)
+            | AgentRun.code_lab_job_id.in_(code_lab_jobs_with_course)
         )
     if role is not None:
         statement = statement.where(AgentRun.role == role)

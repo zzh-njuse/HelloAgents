@@ -150,11 +150,13 @@ export interface TutorTurn { id: string; session_id: string; ordinal: number; at
 export interface TutorSession { id: string; workspace_id: string; course_id: string; course_version_id: string; status: string; provider: string; model: string; created_at: string; turns: TutorTurn[] }
 export interface TutorSkillCapability { teaching_skill: TutorTeachingSkill }
 
-export type AgentRunRole = "course_architect" | "lesson_writer" | "tutor";
+// Stage 5 Slice 1A: seven known roles. The response role field is a plain
+// string so unknown historical values are preserved rather than rejected.
+export type AgentRunRole = "course_architect" | "lesson_writer" | "tutor" | "exercise_author" | "answer_grader" | "scientific_solution_grader" | "code_execution";
 export type AgentRunStatus = "running" | "succeeded" | "failed" | "canceled";
 
 export interface AgentRunIdentity {
-  kind: "course_generation" | "tutor";
+  kind: "course_generation" | "tutor" | "practice" | "code_execution" | "unknown";
   job_type: string | null;
   course_id: string | null;
   course_title: string | null;
@@ -162,6 +164,7 @@ export interface AgentRunIdentity {
   lesson_id: string | null;
   lesson_title: string | null;
   tutor_scope: string | null;
+  code_language: string | null;
 }
 
 export interface AgentToolCallRead {
@@ -176,7 +179,9 @@ export interface AgentToolCallRead {
 
 export interface AgentRunSummary {
   id: string;
-  role: AgentRunRole;
+  // Role is a plain string to safely handle unknown historical values.
+  // Use AgentRunRole for known filter values.
+  role: string;
   status: AgentRunStatus;
   attempt_number: number;
   step_count: number;
@@ -300,8 +305,8 @@ export async function answerMaterials(workspaceId: string, question: string): Pr
   });
 }
 
-export async function fetchCourses(workspaceId: string): Promise<Course[]> {
-  return request<Course[]>(`/api/v1/workspaces/${workspaceId}/courses`);
+export async function fetchCourses(workspaceId: string, signal?: AbortSignal): Promise<Course[]> {
+  return request<Course[]>(`/api/v1/workspaces/${workspaceId}/courses`, { signal });
 }
 
 export async function createCourse(workspaceId: string, payload: { title: string; goal: string; audience?: string; document_ids: string[]; output_language: "zh-CN" | "en" }): Promise<{ course: Course; job: CourseGenerationJob }> {

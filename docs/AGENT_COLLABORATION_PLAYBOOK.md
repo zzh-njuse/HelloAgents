@@ -297,6 +297,16 @@ Agent 可以完成分析、实现、测试和 review，但不能把“技术上�
 
 Stage 3 已于 2026-07-16 收尾。Stage 4 Slice 1/2/3/4 已分别完成练习反馈、掌握度与 Memory、版本化教学 Skill、受控代码执行与 Wolfram MCP 闭环。2026-07-23 根据真实 smoke 新增计划外 Slice 5，只负责练习生成与评分链路稳定化；Slice 5 已于 2026-07-24 完成事实盘点、Spec/ADR、受控实现、独立验收、分块 OCR 与人工 smoke，Stage 4 至此归档：
 
+- Stage 5 可观测、系统验证与质量优化的顶层方向已于 2026-07-27 通过人工
+  Gate；Slice 1A 已完成实现、独立验收、浏览器 smoke 和 OCR，Slice 1B/1C
+  尚未批准。
+- Stage 5 成本展示统一使用人民币，不建设多币种、实时汇率、折扣、套餐或
+  账单系统。
+- Stage 5 默认一个 Slice 只承担一个主要风险轴；Spec 接受后先建立最小纵向
+  验收路径，并分层报告单元、组件、编排、数据库、环境、浏览器和真实 provider
+  验证。
+- 备份恢复与部署安全加固顺延到后续阶段，不视为取消或已经解决。
+
 - Slice 4 只实现已接受的两项 capability：用户显式触发的自托管 Python/Java/C++ 代码实验室，以及用户按 Tutor Turn 授权后由 Agent 在白名单内选择的 Wolfram 科学工具。
 - 管理员负责安装和审核 MCP，产品维护 capability 白名单；不得扩展成任意 MCP 市场、用户自定义 URL、Agent 自主运行代码、任意命令、任意网络或网页搜索。
 - Wolfram Cloud MCP 仅作为可选远程 capability；未配置或不可用不得阻塞核心学习路径。真实远程调用、账号条款和可能的付费操作仍须人工确认。
