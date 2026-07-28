@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from academic_companion.course_agents import CourseAgentRequest, CourseOutlineArtifact, LessonCoveragePlan, LessonCoverageVerification, LessonDraftArtifact, LessonRepairArtifact, LessonUnitArtifact, build_generation_prompt, build_lesson_coverage_prompt, build_lesson_repair_prompt, build_lesson_unit_prompt, build_lesson_unit_repair_prompt, build_lesson_verification_prompt, build_search_prompt, validate_citations
 from learn_platform_api.db.models import AgentRun, AgentToolCall, Course, CourseGenerationJob, CourseGenerationJobSource, CourseSection, CourseSectionCitation, CourseVersion, CourseVersionSource, JobToolAuthorization, Lesson, LessonCitation, LessonVersion, SourceDocument, DocumentChunk, DocumentVersion, Workspace
 from learn_platform_api.services.retrieval import retrieve
+from learn_platform_api.services.provider_call_recorder import record_provider_call, COURSE_PHASES
 from learn_platform_api.settings import Settings
 
 
@@ -60,8 +61,31 @@ def call_provider(settings: Settings, messages: list[dict[str, str]], max_output
         body = response.json()
         content = body["choices"][0]["message"]["content"]
         return json.loads(content), {"input_tokens": body.get("usage", {}).get("prompt_tokens"), "output_tokens": body.get("usage", {}).get("completion_tokens"), "finish_reason": body["choices"][0].get("finish_reason")}
-    except (httpx.HTTPError, KeyError, TypeError, json.JSONDecodeError) as exc:
+    except (httpx.HTTPError, IndexError, KeyError, TypeError, json.JSONDecodeError) as exc:
         raise ValueError("generation_provider_unavailable") from exc
+
+
+def _recorded_call_provider(
+    db: Session,
+    settings: Settings,
+    messages: list[dict[str, str]],
+    *,
+    workspace_id: str,
+    agent_run_id: str,
+    phase: str,
+    max_output_tokens: int | None = None,
+    timeout_seconds: float | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """call_provider wrapped with Provider Call recording."""
+    return record_provider_call(
+        db,
+        workspace_id=workspace_id,
+        provider=settings.product_generation_provider,
+        model=settings.product_generation_model,
+        phase=phase,
+        agent_run_id=agent_run_id,
+        call_fn=lambda: call_provider(settings, messages, max_output_tokens, timeout_seconds),
+    )
 
 
 def _tool_call(db: Session, run: AgentRun, name: str, ordinal: int, query: str | None, count: int | None, started: float, status: str = "succeeded", error: str | None = None) -> None:
@@ -184,11 +208,13 @@ def _execute_lesson_generation(db: Session, settings: Settings, job: CourseGener
         if provider_calls >= settings.lesson_generation_max_provider_calls:
             raise ValueError("lesson_budget_exceeded")
         phase_started = time.perf_counter()
-        generated, usage = call_provider(
-            settings,
-            messages,
-            settings.lesson_generation_max_output_tokens_per_call,
-            settings.lesson_generation_timeout_seconds,
+        generated, usage = _recorded_call_provider(
+            db, settings, messages,
+            workspace_id=job.workspace_id,
+            agent_run_id=run.id,
+            phase="generation" if "Write" in name or "Plan" in name or "Verify" in name else "repair",
+            max_output_tokens=settings.lesson_generation_max_output_tokens_per_call,
+            timeout_seconds=settings.lesson_generation_timeout_seconds,
         )
         provider_calls += 1
         _lesson_job_active(db, job, settings, started)
@@ -444,7 +470,7 @@ def execute_generation(db: Session, settings: Settings, job: CourseGenerationJob
         return
     run = AgentRun(course_generation_job_id=job.id, workspace_id=job.workspace_id, role=role, attempt_number=job.attempt_count, status="running")
     db.add(run); db.flush()
-    plan, plan_usage = call_provider(settings, build_search_prompt(role, request))
+    plan, plan_usage = _recorded_call_provider(db, settings, build_search_prompt(role, request), workspace_id=job.workspace_id, agent_run_id=run.id, phase="plan")
     maximum_searches = 5 if role == "course_architect" else 3
     queries = plan.get("queries") if isinstance(plan, dict) else None
     if not isinstance(queries, list) or not 1 <= len(queries) <= maximum_searches or any(not isinstance(query, str) or not query.strip() or len(query) > 300 for query in queries):
@@ -472,7 +498,7 @@ def execute_generation(db: Session, settings: Settings, job: CourseGenerationJob
     if not evidence:
         raise ValueError("insufficient_evidence")
     messages = build_generation_prompt(role, request, evidence)
-    generated, usage = call_provider(settings, messages)
+    generated, usage = _recorded_call_provider(db, settings, messages, workspace_id=job.workspace_id, agent_run_id=run.id, phase="generation")
     usage = {"input_tokens": (plan_usage["input_tokens"] or 0) + (usage["input_tokens"] or 0), "output_tokens": (plan_usage["output_tokens"] or 0) + (usage["output_tokens"] or 0)}
     submit_started = time.perf_counter()
     submit_ordinal = len(queries) + 1
@@ -485,7 +511,7 @@ def execute_generation(db: Session, settings: Settings, job: CourseGenerationJob
         if submit_ordinal + 1 > maximum_steps:
             raise ValueError("agent_step_budget_exceeded") from exc
         repair_messages = messages + [{"role": "assistant", "content": json.dumps(generated, ensure_ascii=False)}, {"role": "user", "content": f"Repair only the JSON structure and citations. Validation error: {type(exc).__name__}. Return JSON only."}]
-        generated, repair_usage = call_provider(settings, repair_messages)
+        generated, repair_usage = _recorded_call_provider(db, settings, repair_messages, workspace_id=job.workspace_id, agent_run_id=run.id, phase="repair")
         usage = {"input_tokens": (usage["input_tokens"] or 0) + (repair_usage["input_tokens"] or 0), "output_tokens": (usage["output_tokens"] or 0) + (repair_usage["output_tokens"] or 0)}
         submit_ordinal += 1
         submit_started = time.perf_counter()

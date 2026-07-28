@@ -72,6 +72,7 @@ from learn_platform_api.db.models import (
     Workspace,
 )
 from learn_platform_api.services.retrieval import retrieve
+from learn_platform_api.services.provider_call_recorder import record_provider_call, PRACTICE_GENERATION_PHASES, PRACTICE_GRADING_PHASES
 from learn_platform_api.settings import Settings
 from learn_platform_api.services.practice_type_adaptation import (
     determine_suitability, validate_item_type_mode,
@@ -195,7 +196,7 @@ def call_provider(settings: Settings, messages: list[dict[str, str]], max_output
         body = response.json()
         content = body["choices"][0]["message"]["content"]
         return json.loads(content), {"input_tokens": body.get("usage", {}).get("prompt_tokens"), "output_tokens": body.get("usage", {}).get("completion_tokens"), "finish_reason": body["choices"][0].get("finish_reason")}
-    except (httpx.HTTPError, KeyError, TypeError, json.JSONDecodeError) as exc:
+    except (httpx.HTTPError, IndexError, KeyError, TypeError, json.JSONDecodeError) as exc:
         raise ValueError("provider_unavailable") from exc
 
 
@@ -220,7 +221,7 @@ def call_practice_provider(settings: Settings, messages: list[dict[str, str]], m
         body = response.json()
         content = body["choices"][0]["message"]["content"]
         return json.loads(content), {"input_tokens": body.get("usage", {}).get("prompt_tokens"), "output_tokens": body.get("usage", {}).get("completion_tokens"), "finish_reason": body["choices"][0].get("finish_reason")}
-    except (httpx.HTTPError, KeyError, TypeError, json.JSONDecodeError) as exc:
+    except (httpx.HTTPError, IndexError, KeyError, TypeError, json.JSONDecodeError) as exc:
         raise ValueError("provider_unavailable") from exc
 
 
@@ -425,7 +426,7 @@ def execute_generation(db: Session, settings: Settings, job: PracticeJob, *, wor
     output_missing = False
     estimated_output = 0      # separate hard-budget estimate; never reported as provider usage
 
-    def provider_step(messages: list[dict[str, str]], max_tokens: int) -> tuple[dict[str, Any], float]:
+    def provider_step(messages: list[dict[str, str]], max_tokens: int, *, phase: str | None = None) -> tuple[dict[str, Any], float]:
         """Counted provider call (step + usage). Does NOT write a tool call: plan
         is an internal step, and submit tool traces are written by the submit
         logic with the correct succeeded/failed status.
@@ -440,7 +441,16 @@ def execute_generation(db: Session, settings: Settings, job: PracticeJob, *, wor
         provider_calls += 1
         ordinal += 1
         run.step_count = ordinal  # count the attempt before it runs
-        generated, usage = call_practice_provider(settings, messages, max_tokens, settings.practice_generation_timeout_seconds)
+        resolved_phase = phase if phase is not None else ("plan" if provider_calls <= 1 else "generation")
+        generated, usage = record_provider_call(
+            db,
+            workspace_id=job.workspace_id,
+            provider=settings.product_generation_provider,
+            model=settings.practice_generation_model,
+            phase=resolved_phase,
+            agent_run_id=run.id,
+            call_fn=lambda: call_practice_provider(settings, messages, max_tokens, settings.practice_generation_timeout_seconds),
+        )
         reported_in = usage.get("input_tokens")
         reported_out = usage.get("output_tokens")
         if reported_in is None:
@@ -503,8 +513,8 @@ def execute_generation(db: Session, settings: Settings, job: PracticeJob, *, wor
     if not evidence:
         raise ValueError("insufficient_evidence")
 
-    def submit_attempt(messages: list[dict[str, str]]) -> tuple[Any, float]:
-        return provider_step(messages, settings.practice_generation_max_output_tokens)
+    def submit_attempt(messages: list[dict[str, str]], *, phase: str | None = None) -> tuple[Any, float]:
+        return provider_step(messages, settings.practice_generation_max_output_tokens, phase=phase)
 
     def validation_issues(exc: ValidationError | ValueError) -> list[str]:
         if isinstance(exc, ValidationError):
@@ -625,7 +635,7 @@ def execute_generation(db: Session, settings: Settings, job: PracticeJob, *, wor
             # Set-level or general-item-level: whole-Set structure repair
             if provider_calls >= settings.practice_generation_max_provider_calls or ordinal >= settings.practice_generation_max_attempt_steps:
                 raise ValueError(code) from exc
-            repaired, repair_started = submit_attempt(build_practice_repair_prompt(request, evidence, generated, issues))
+            repaired, repair_started = submit_attempt(build_practice_repair_prompt(request, evidence, generated, issues), phase="repair")
             try:
                 artifact = PracticeSetArtifact.model_validate(repaired)
                 validate_practice_citations(artifact, set(chunks))
@@ -656,6 +666,7 @@ def execute_generation(db: Session, settings: Settings, job: PracticeJob, *, wor
         repaired_raw, novelty_started = provider_step(
             build_novelty_item_repair_prompt(request, evidence, dup_item, request.prior_stems),
             settings.practice_generation_max_output_tokens,
+            phase="repair",
         )
         try:
             novelty_set = PracticeSetArtifact.model_validate(repaired_raw)
@@ -854,6 +865,7 @@ def execute_generation(db: Session, settings: Settings, job: PracticeJob, *, wor
                 safe_position_summary=safe_summary,
             ),
             settings.practice_generation_max_output_tokens,
+            phase="repair",
         )
         try:
             # Correction 002 §A: validate the repair response using the STRICT
@@ -2231,7 +2243,7 @@ def execute_grading(db: Session, settings: Settings, job: PracticeJob, *, worker
         output_missing = False
         estimated_output = 0
 
-        def provider_step(messages: list[dict[str, str]]) -> tuple[dict[str, Any], float]:
+        def provider_step(messages: list[dict[str, str]], *, phase: str | None = None) -> tuple[dict[str, Any], float]:
             nonlocal ordinal, provider_calls, input_total, output_total, input_missing, output_missing, estimated_output
             _check_active(db, job, worker_id, started=started, wall_limit=settings.practice_grading_max_wall_seconds, lease_lost=lease_lost)
             if provider_calls >= settings.practice_grading_max_provider_calls:
@@ -2240,7 +2252,16 @@ def execute_grading(db: Session, settings: Settings, job: PracticeJob, *, worker
             provider_calls += 1
             ordinal += 1
             run.step_count = ordinal
-            generated, usage = call_provider(settings, messages, settings.practice_grading_max_output_tokens, settings.practice_grading_timeout_seconds)
+            resolved_phase = phase if phase is not None else "grading"
+            generated, usage = record_provider_call(
+                db,
+                workspace_id=job.workspace_id,
+                provider=settings.product_generation_provider,
+                model=settings.product_generation_model,
+                phase=resolved_phase,
+                agent_run_id=run.id,
+                call_fn=lambda: call_provider(settings, messages, settings.practice_grading_max_output_tokens, settings.practice_grading_timeout_seconds),
+            )
             reported_in = usage.get("input_tokens")
             reported_out = usage.get("output_tokens")
             if reported_in is None:
@@ -2520,7 +2541,7 @@ def execute_grading(db: Session, settings: Settings, job: PracticeJob, *, worker
     output_missing = False
     estimated_output = 0
 
-    def provider_step(messages: list[dict[str, str]]) -> tuple[dict[str, Any], float]:
+    def provider_step(messages: list[dict[str, str]], *, phase: str | None = None) -> tuple[dict[str, Any], float]:
         nonlocal ordinal, provider_calls, input_total, output_total, input_missing, output_missing, estimated_output
         _check_active(db, job, worker_id, started=started, wall_limit=settings.practice_grading_max_wall_seconds, lease_lost=lease_lost)
         if provider_calls >= settings.practice_grading_max_provider_calls:
@@ -2529,7 +2550,16 @@ def execute_grading(db: Session, settings: Settings, job: PracticeJob, *, worker
         provider_calls += 1
         ordinal += 1
         run.step_count = ordinal  # count the attempt before it runs
-        generated, usage = call_provider(settings, messages, settings.practice_grading_max_output_tokens, settings.practice_grading_timeout_seconds)
+        resolved_phase = phase if phase is not None else "grading"
+        generated, usage = record_provider_call(
+            db,
+            workspace_id=job.workspace_id,
+            provider=settings.product_generation_provider,
+            model=settings.product_generation_model,
+            phase=resolved_phase,
+            agent_run_id=run.id,
+            call_fn=lambda: call_provider(settings, messages, settings.practice_grading_max_output_tokens, settings.practice_grading_timeout_seconds),
+        )
         reported_in = usage.get("input_tokens")
         reported_out = usage.get("output_tokens")
         if reported_in is None:
@@ -2557,7 +2587,7 @@ def execute_grading(db: Session, settings: Settings, job: PracticeJob, *, worker
         _tool_call(db, run, "SubmitPracticeFeedback", ordinal, None, None, submit_started, "failed", "invalid_practice_artifact")
         if provider_calls >= settings.practice_grading_max_provider_calls:
             raise ValueError("invalid_practice_artifact") from exc
-        repaired, repair_started = provider_step(build_grading_repair_prompt(request, generated))
+        repaired, repair_started = provider_step(build_grading_repair_prompt(request, generated), phase="repair")
         try:
             feedback = PracticeFeedbackArtifact.model_validate(repaired)
             validate_feedback_citations(feedback, allowed_citations, rubric_keys)

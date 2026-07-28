@@ -1,9 +1,11 @@
 from datetime import datetime, timezone
+from decimal import Decimal
 from uuid import uuid4
 
-from sqlalchemy import JSON, Boolean, CheckConstraint, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, text
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy import JSON, Boolean, CheckConstraint, DateTime, Float, ForeignKey, ForeignKeyConstraint, Index, Integer, Numeric, String, Text, UniqueConstraint, text
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from ..services.provider_cost import CURRENCY_CNY, RATE_NUMERIC_PRECISION, RATE_NUMERIC_SCALE
 from .base import Base
 
 
@@ -208,6 +210,14 @@ class IngestionBatchItem(Base):
 
 class RagAnswerTrace(Base):
     __tablename__ = "rag_answer_traces"
+    __table_args__ = (
+        # Composite-FK target for provider_calls (Stage 5 Slice 1B-2:
+        # RAG owner Workspace isolation). ``id`` is already the PK, so
+        # (id, workspace_id) is trivially unique and this can never be
+        # violated — it exists only so Postgres accepts the matching
+        # composite foreign key on provider_calls below.
+        UniqueConstraint("id", "workspace_id", name="uq_rag_answer_traces_id_workspace"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True, nullable=False)
@@ -479,6 +489,13 @@ class AgentRun(Base):
             "(CASE WHEN code_lab_job_id IS NOT NULL THEN 1 ELSE 0 END)) = 1",
             name="ck_agent_runs_one_owner",
         ),
+        # Composite-FK target for provider_calls (Stage 5 Slice 1B-1 Issue 1:
+        # Workspace isolation). ``id`` is already the PK, so (id, workspace_id)
+        # is trivially unique and this can never be violated — it exists only so
+        # Postgres accepts the matching composite foreign key on provider_calls.
+        # Human-approved minimal hardening of an existing table (2026-07-27);
+        # recorded in Spec 002 / ADR 001.
+        UniqueConstraint("id", "workspace_id", name="uq_agent_runs_id_workspace"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
@@ -1093,3 +1110,167 @@ class JobToolAuthorization(Base):
     # Timestamps
     authorized_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
     consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+# --------------------------------------------------------------------------- #
+# Stage 5 Slice 1B-1: Provider Call and CNY rate snapshot foundation
+# (Spec 002 / ADR 001). Independent facts for per-request provider cost.
+# This slice only defines schema + a pure calculator; no business chain,
+# API/Web or real provider calls are wired here.
+# --------------------------------------------------------------------------- #
+
+
+class ProviderRateSnapshot(Base):
+    """Append-only CNY price snapshot for a provider/model (Spec 002 §2).
+
+    Human-maintained per-million-token input/output unit prices, fixed to CNY.
+    A Provider Call binds an immutable snapshot so historical cost never reads
+    the current configuration. There is intentionally no update/delete business
+    method on this fact.
+    """
+
+    __tablename__ = "provider_rate_snapshots"
+    __table_args__ = (
+        UniqueConstraint("provider", "model", "effective_at", name="uq_provider_rate_snapshots_pme"),
+        # Composite-FK target for provider_calls (Issue 2: no wrong-price
+        # binding). ``id`` is already the PK, so (id, provider, model) is
+        # trivially unique and this constraint can never be violated — it exists
+        # only so Postgres accepts the matching composite foreign key below.
+        UniqueConstraint("id", "provider", "model", name="uq_provider_rate_snapshots_id_provider_model"),
+        CheckConstraint("currency = 'CNY'", name="ck_provider_rate_snapshots_currency_cny"),
+        CheckConstraint("input_rate_per_1m >= 0", name="ck_provider_rate_snapshots_input_rate_nonneg"),
+        CheckConstraint("output_rate_per_1m >= 0", name="ck_provider_rate_snapshots_output_rate_nonneg"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    provider: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    model: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    currency: Mapped[str] = mapped_column(String(3), nullable=False, default=CURRENCY_CNY, server_default=CURRENCY_CNY)
+    input_rate_per_1m: Mapped[Decimal] = mapped_column(Numeric(RATE_NUMERIC_PRECISION, RATE_NUMERIC_SCALE), nullable=False)
+    output_rate_per_1m: Mapped[Decimal] = mapped_column(Numeric(RATE_NUMERIC_PRECISION, RATE_NUMERIC_SCALE), nullable=False)
+    effective_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class ProviderCall(Base):
+    """One real provider request attempt — not an Agent step or Tool call.
+
+    Per Spec 002 §2 / ADR 001: provider/model, usage, status and price are
+    captured as a call-time snapshot so repair/retry and multiple requests
+    never overwrite each other. Never stores prompt, message, evidence,
+    answer, provider raw response or raw error — only a stable error code.
+
+    Per Spec 003 §4 / ADR 002: agent_run_id and rag_answer_trace_id are
+    mutually exclusive (at most one non-null). Both NULL allows workspace-only
+    calls. RAG owner uses a composite FK for Workspace isolation, matching
+    the AgentRun pattern from 0024.
+    """
+
+    __tablename__ = "provider_calls"
+    __table_args__ = (
+        CheckConstraint("ordinal >= 0", name="ck_provider_calls_ordinal_nonneg"),
+        CheckConstraint(
+            "status IN ('started','succeeded','failed','timed_out','canceled')",
+            name="ck_provider_calls_status_valid",
+        ),
+        CheckConstraint("input_tokens IS NULL OR input_tokens >= 0", name="ck_provider_calls_input_tokens_nonneg"),
+        CheckConstraint("output_tokens IS NULL OR output_tokens >= 0", name="ck_provider_calls_output_tokens_nonneg"),
+        CheckConstraint("latency_ms IS NULL OR latency_ms >= 0", name="ck_provider_calls_latency_nonneg"),
+        # Owner mutual exclusion (Spec 003 §4): at most one of agent_run_id
+        # or rag_answer_trace_id may be non-null. Both NULL is allowed
+        # (workspace-only call).
+        CheckConstraint(
+            "(CASE WHEN agent_run_id IS NOT NULL THEN 1 ELSE 0 END) + "
+            "(CASE WHEN rag_answer_trace_id IS NOT NULL THEN 1 ELSE 0 END) <= 1",
+            name="ck_provider_calls_one_owner",
+        ),
+        # Issue 2: a bound snapshot's provider/model must equal the call's
+        # provider/model, so a call can never inherit another model's price.
+        # Composite FK over (snapshot_id, provider, model): MATCH SIMPLE skips
+        # it when provider_rate_snapshot_id IS NULL (call has no snapshot);
+        # when set, the (id, provider, model) triple must exist on
+        # provider_rate_snapshots, forcing the provider/model to match.
+        ForeignKeyConstraint(
+            ["provider_rate_snapshot_id", "provider", "model"],
+            ["provider_rate_snapshots.id", "provider_rate_snapshots.provider", "provider_rate_snapshots.model"],
+            name="fk_provider_calls_snapshot_provider_model",
+        ),
+        # Issue 1: when a call is bound to an AgentRun, its workspace_id must
+        # equal the run's workspace_id (Workspace isolation). Composite FK over
+        # (agent_run_id, workspace_id): MATCH SIMPLE skips it when
+        # agent_run_id IS NULL (workspace-only call); when set, the
+        # (id, workspace_id) pair must exist on agent_runs, forcing the
+        # workspaces to match. ON DELETE CASCADE is required here because
+        # Postgres checks constraints in DDL order; since this composite FK
+        # appears before the simple FK in SQLAlchemy's emitted DDL, NO ACTION
+        # would block the AgentRun delete before the simple FK's CASCADE fires.
+        ForeignKeyConstraint(
+            ["agent_run_id", "workspace_id"],
+            ["agent_runs.id", "agent_runs.workspace_id"],
+            name="fk_provider_calls_run_workspace",
+            ondelete="CASCADE",
+        ),
+        # RAG owner Workspace isolation (Spec 003 §4 / ADR 002 §7):
+        # when a call is bound to a RagAnswerTrace, its workspace_id must
+        # equal the trace's workspace_id. Composite FK over
+        # (rag_answer_trace_id, workspace_id): MATCH SIMPLE skips it when
+        # rag_answer_trace_id IS NULL; when set, forces workspace match.
+        # ON DELETE CASCADE: deleting a RagAnswerTrace cascades to its calls.
+        ForeignKeyConstraint(
+            ["rag_answer_trace_id", "workspace_id"],
+            ["rag_answer_traces.id", "rag_answer_traces.workspace_id"],
+            name="fk_provider_calls_rag_trace_workspace",
+            ondelete="CASCADE",
+        ),
+        # ordinal uniquely identifies a call within a run (Spec §5 gate).
+        # Workspace-only calls (no agent_run) are excluded so they don't clash.
+        Index(
+            "uq_provider_calls_run_ordinal",
+            "agent_run_id",
+            "ordinal",
+            unique=True,
+            postgresql_where=text("agent_run_id IS NOT NULL"),
+            sqlite_where=text("agent_run_id IS NOT NULL"),
+        ),
+        # RAG owner ordinal uniqueness (Spec 003 §4): ordinal is unique within
+        # a RagAnswerTrace. Calls without a RAG trace are excluded.
+        Index(
+            "uq_provider_calls_rag_trace_ordinal",
+            "rag_answer_trace_id",
+            "ordinal",
+            unique=True,
+            postgresql_where=text("rag_answer_trace_id IS NOT NULL"),
+            sqlite_where=text("rag_answer_trace_id IS NOT NULL"),
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id", ondelete="CASCADE"), index=True, nullable=False)
+    agent_run_id: Mapped[str | None] = mapped_column(ForeignKey("agent_runs.id", ondelete="CASCADE"), index=True, nullable=True)
+    rag_answer_trace_id: Mapped[str | None] = mapped_column(ForeignKey("rag_answer_traces.id", ondelete="CASCADE"), index=True, nullable=True)
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    phase: Mapped[str] = mapped_column(String(40), nullable=False)
+    provider: Mapped[str] = mapped_column(String(100), nullable=False)
+    model: Mapped[str] = mapped_column(String(100), nullable=False)
+    status: Mapped[str] = mapped_column(String(30), default="started", nullable=False, index=True)
+    input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Stable error code only — no raw error text, message or provider payload.
+    error_code: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    provider_rate_snapshot_id: Mapped[str | None] = mapped_column(
+        ForeignKey("provider_rate_snapshots.id"), index=True, nullable=True
+    )
+    # Eager-joinable relationship for the read API (Slice 1B-3).
+    # Never used for write; the recorder sets provider_rate_snapshot_id directly.
+    # foreign_keys is required because there are two FK paths between
+    # provider_calls and provider_rate_snapshots (the simple FK on
+    # provider_rate_snapshot_id, and the composite FK for Issue 2).
+    provider_rate_snapshot: Mapped[ProviderRateSnapshot | None] = relationship(
+        ProviderRateSnapshot,
+        foreign_keys=[provider_rate_snapshot_id],
+        lazy="select",
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)

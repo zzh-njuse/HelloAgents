@@ -13,6 +13,7 @@ from academic_companion.teaching_skills.prompts import plan_prompt as skill_plan
 from academic_companion.tutor_agents import TutorAnswerArtifact, answer_prompt, search_prompt
 from learn_platform_api.db.models import AgentRun, AgentToolCall, CodeLabRun, Course, CourseVersionSource, DocumentChunk, DocumentVersion, LearningMemory, LearningMemoryPolicy, LearningTarget, Lesson, LessonCitation, LessonCompletion, LessonVersion, MasteryState, SourceDocument, TutorSession, TutorTurn, TutorTurnCitation, TutorTurnCodeRun, TutorTurnToolAuthorization, Weakness, Workspace
 from learn_platform_api.services.course_generation import call_provider
+from learn_platform_api.services.provider_call_recorder import record_provider_call, TUTOR_PHASES
 from learn_platform_api.services.retrieval import retrieve
 from learn_platform_api.settings import Settings
 
@@ -1180,7 +1181,7 @@ def _execute_skill_turn(db: Session, settings: Settings, turn: TutorTurn, sessio
     step = 0
     max_decision_steps = getattr(settings, "tutor_max_decision_steps", 8)
 
-    def provider_step(messages: list[dict], max_tokens: int) -> tuple[object, dict]:
+    def provider_step(messages: list[dict], max_tokens: int, *, phase: str | None = None) -> tuple[object, dict]:
         nonlocal step
         _check_tutor_active(db, turn, worker_id, lease_lost)
         if step >= max_decision_steps:
@@ -1188,7 +1189,16 @@ def _execute_skill_turn(db: Session, settings: Settings, turn: TutorTurn, sessio
         step += 1
         run.step_count = step
         db.flush()
-        generated, usage = call_provider(settings, messages, max_tokens)
+        resolved_phase = phase if phase is not None else ("plan" if step == 1 else "answer")
+        generated, usage = record_provider_call(
+            db,
+            workspace_id=turn.workspace_id,
+            provider=settings.product_generation_provider,
+            model=settings.product_generation_model,
+            phase=resolved_phase,
+            agent_run_id=run.id,
+            call_fn=lambda: call_provider(settings, messages, max_tokens),
+        )
         usages.append(usage)
         _record_usage(turn, run, usages, db)
         return generated, usage
@@ -1388,7 +1398,7 @@ def _execute_skill_turn(db: Session, settings: Settings, turn: TutorTurn, sessio
                 ),
             },
         ]
-        repair_raw, _repair_usage = provider_step(repair_messages, settings.tutor_skill_max_output_tokens)
+        repair_raw, _repair_usage = provider_step(repair_messages, settings.tutor_skill_max_output_tokens, phase="repair")
         try:
             artifact = _validate_teaching_answer(repair_raw, set(ledger), learning_state_injected, target_certainties, memory_texts, plan.intent)
         except (ValidationError, ValueError) as repair_exc:
@@ -1413,7 +1423,7 @@ def _execute_skill_turn(db: Session, settings: Settings, turn: TutorTurn, sessio
                     ),
                 },
             ]
-            repair_raw, _repair_usage = provider_step(repair_messages, settings.tutor_skill_max_output_tokens)
+            repair_raw, _repair_usage = provider_step(repair_messages, settings.tutor_skill_max_output_tokens, phase="repair")
             try:
                 artifact = _validate_teaching_answer(repair_raw, set(ledger), learning_state_injected, target_certainties, memory_texts, plan.intent)
                 has_limitation_after_repair = any(block.type == "limitation" for block in artifact.blocks)
@@ -1446,7 +1456,7 @@ def _execute_baseline_turn(db: Session, settings: Settings, turn: TutorTurn, ses
         ordinal += 1
         return ordinal
 
-    def provider_step(messages, max_tokens):
+    def provider_step(messages, max_tokens, *, phase=None):
         nonlocal step
         _check_tutor_active(db, turn, worker_id, lease_lost)
         if step + 1 > 5:
@@ -1454,7 +1464,16 @@ def _execute_baseline_turn(db: Session, settings: Settings, turn: TutorTurn, ses
         step += 1
         run.step_count = step
         db.flush()
-        generated, usage = call_provider(settings, messages, max_tokens)
+        resolved_phase = phase if phase is not None else ("plan" if step == 1 else "answer")
+        generated, usage = record_provider_call(
+            db,
+            workspace_id=turn.workspace_id,
+            provider=settings.product_generation_provider,
+            model=settings.product_generation_model,
+            phase=resolved_phase,
+            agent_run_id=run.id,
+            call_fn=lambda: call_provider(settings, messages, max_tokens),
+        )
         usages.append(usage)
         _record_usage(turn, run, usages, db)
         return generated, usage
@@ -1500,7 +1519,7 @@ def _execute_baseline_turn(db: Session, settings: Settings, turn: TutorTurn, ses
     try:
         artifact = _validate_answer(generated, set(ledger))
     except (ValidationError, ValueError):
-        repaired, _repair_usage = provider_step(messages + [{"role": "assistant", "content": str(generated)}, {"role": "user", "content": "Repair JSON structure and citation IDs only. Return JSON."}], settings.tutor_max_output_tokens)
+        repaired, _repair_usage = provider_step(messages + [{"role": "assistant", "content": str(generated)}, {"role": "user", "content": "Repair JSON structure and citation IDs only. Return JSON."}], settings.tutor_max_output_tokens, phase="repair")
         try:
             artifact = _validate_answer(repaired, set(ledger))
         except (ValidationError, ValueError) as repair_exc:

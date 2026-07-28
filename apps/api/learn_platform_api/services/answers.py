@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from learn_platform_api.db.models import RagAnswerTrace
 from learn_platform_api.schemas.documents import AnswerCitation, AnswerClaim
+from learn_platform_api.services.provider_call_recorder import record_provider_call, RAG_ANSWER_PHASES
 from learn_platform_api.services.retrieval import retrieve
 from learn_platform_api.settings import Settings
 
@@ -124,7 +125,7 @@ def _generate(settings: Settings, messages: list[dict[str, str]]) -> tuple[dict[
         usage_raw = payload.get("usage", {})
         usage = {"input_tokens": usage_raw.get("prompt_tokens"), "output_tokens": usage_raw.get("completion_tokens")}
         return result, usage, round((time.perf_counter() - started) * 1000)
-    except (KeyError, TypeError, json.JSONDecodeError) as exc:
+    except (IndexError, KeyError, TypeError, json.JSONDecodeError) as exc:
         raise ValueError("invalid_model_output") from exc
     except httpx.HTTPError as exc:
         raise ValueError("generation_provider_unavailable") from exc
@@ -210,12 +211,56 @@ def answer_question(
         return {"trace_id": trace.id, "status": "insufficient_evidence", "claims": [], "citations": [], "limitations": ["当前资料不足以回答该问题"], "model": None, "usage": {"input_tokens": None, "output_tokens": None}}
     if settings.product_generation_provider != "deepseek" or not settings.product_generation_api_key:
         raise ValueError("generation_provider_unconfigured")
+    # Create the RagAnswerTrace early so Provider Calls can reference it
+    # as their owner (Spec 003 §4 / ADR 002 §7).
+    trace = RagAnswerTrace(
+        workspace_id=workspace_id,
+        query_trace_id=query_trace_id,
+        question_hash=hashlib.sha256(question.encode("utf-8")).hexdigest(),
+        status="running",
+        provider=settings.product_generation_provider,
+        model=settings.product_generation_model,
+        prompt_template_version=PROMPT_TEMPLATE_VERSION,
+        evidence_chunk_ids=[citation.chunk_id for citation in citations],
+        citation_ids=[citation.citation_id for citation in citations],
+    )
+    db.add(trace)
+    db.flush()
+    # _generate returns (result, usage, latency_ms) but record_provider_call
+    # expects call_fn to return (result, usage). Wrap to strip latency and
+    # track it externally.
+    _gen_latency = [0]  # mutable container for latency accumulation
+
+    def _call_generate_for_recorder(messages):
+        """Wrap _generate to return (result, usage) 2-tuple for record_provider_call."""
+        result, usage, latency = _generate(settings, messages)
+        _gen_latency[0] = latency
+        return result, usage
+
     try:
-        generated, usage, generation_latency = _generate(settings, _prompt(question, citations))
+        generated, usage = record_provider_call(
+            db,
+            workspace_id=workspace_id,
+            provider=settings.product_generation_provider,
+            model=settings.product_generation_model,
+            phase="answer",
+            rag_answer_trace_id=trace.id,
+            call_fn=lambda: _call_generate_for_recorder(_prompt(question, citations)),
+        )
+        generation_latency = _gen_latency[0]
         try:
             claims, _ = _validate_claims(generated, citations)
         except ValueError:
-            generated, repair_usage, repair_latency = _generate(settings, _repair_prompt(generated, citations))
+            generated, repair_usage = record_provider_call(
+                db,
+                workspace_id=workspace_id,
+                provider=settings.product_generation_provider,
+                model=settings.product_generation_model,
+                phase="repair",
+                rag_answer_trace_id=trace.id,
+                call_fn=lambda: _call_generate_for_recorder(_repair_prompt(generated, citations)),
+            )
+            repair_latency = _gen_latency[0]
             claims, _ = _validate_claims(generated, citations)
             generation_latency += repair_latency
             usage = {
@@ -226,18 +271,22 @@ def answer_question(
         # answers expose only cited claims; insufficiency is decided server-side.
         limitations: list[str] = []
         answer_text = "\n".join(claim.text for claim in claims)
-        trace = _record(
-            db, workspace_id=workspace_id, query_trace_id=query_trace_id, question=question, status="succeeded",
-            evidence_ids=[citation.chunk_id for citation in citations], citation_ids=[citation.citation_id for citation in citations],
-            settings=settings, retrieval_latency_ms=retrieval_latency, generation_latency_ms=generation_latency,
-            answer=answer_text, usage=usage,
-        )
+        # Update the trace with final results
+        trace.status = "succeeded"
+        trace.input_tokens = usage.get("input_tokens")
+        trace.output_tokens = usage.get("output_tokens")
+        trace.retrieval_latency_ms = retrieval_latency
+        trace.generation_latency_ms = generation_latency
+        trace.answer_hash = hashlib.sha256(answer_text.encode("utf-8")).hexdigest()
+        trace.completed_at = _now()
+        db.flush()
         return {"trace_id": trace.id, "status": "succeeded", "claims": claims, "citations": citations, "limitations": limitations, "model": settings.product_generation_model, "usage": usage}
-    except ValueError as exc:
-        _record_failure(
-            db, workspace_id=workspace_id, query_trace_id=query_trace_id, question=question, status="failed",
-            evidence_ids=[citation.chunk_id for citation in citations], citation_ids=[citation.citation_id for citation in citations],
-            settings=settings, retrieval_latency_ms=retrieval_latency, error_code=str(exc),
-            error_message="回答服务暂不可用" if str(exc) != "invalid_model_output" else "回答模型返回格式无效",
-        )
+    except Exception as exc:
+        from learn_platform_api.services.provider_call_recorder import classify_error
+        _status, stable_code = classify_error(exc)
+        trace.status = "failed"
+        trace.error_code = stable_code
+        trace.error_message = "回答服务暂不可用" if stable_code != "invalid_model_output" else "回答模型返回格式无效"
+        trace.completed_at = _now()
+        db.flush()
         raise

@@ -1,7 +1,7 @@
 # Platform Stage 5：可观测、系统验证与质量优化
 
 状态：顶层方向已通过人工 Gate；Slice 1A 已于 2026-07-27 完成实现、独立验收、
-浏览器 smoke 和 OCR；Slice 1B/1C 尚未批准
+浏览器 smoke 和 OCR；Slice 1B-1/1B-2/1B-3 已通过独立验收和统一 OCR
 
 Stage 5 的目标不是继续横向增加学习 capability，而是用可信运行事实和可重复
 系统测试定位现有主链路的不稳定性，并据此改善课程、Tutor 和练习体验。Stage 4
@@ -46,6 +46,18 @@ Postgres 备份恢复、Qdrant 重建 runbook、storage reconciliation、Redis/Q
 - [Slice 1A OCR 执行交接](reviews/SLICE_1A_OCR_EXECUTION.md)
 - [Slice 1A OCR Review](reviews/SLICE_1A_OCR_REVIEW.md)
 - [Slice 1A 完成总结](PART_1_SLICE_1A_SUMMARY.md)
+- [Slice 1B-1 Spec：Provider Call 与人民币成本事实基础](specs/002-provider-call-cost-foundation.md)（已接受）
+- [ADR 001：独立 Provider Call 与人民币价格快照](adr/001-provider-call-and-cny-cost-facts.md)（已接受）
+- [Slice 1B-1 GLM 实现任务包](PART_1_SLICE_1B1_GLM_IMPLEMENTATION_PACKET.md)
+- [Slice 1B-2 Spec：Provider Call 业务调用链接入](specs/003-provider-call-business-instrumentation.md)（已接受）
+- [ADR 002：Provider Call 记录生命周期与 RAG Owner](adr/002-provider-call-recording-lifecycle-and-rag-owner.md)（已接受）
+- [Slice 1B-2 GLM 实现任务包](PART_1_SLICE_1B2_GLM_IMPLEMENTATION_PACKET.md)
+- [Slice 1B-2 Codex 独立验收](reviews/SLICE_1B2_CODEX_ACCEPTANCE_REVIEW.md)
+- [Slice 1B-3 Spec：安全 Provider Call 与人民币成本读取 API](specs/004-safe-provider-call-read-api.md)（已接受）
+- [Slice 1B-3 GLM 实现任务包](PART_1_SLICE_1B3_GLM_IMPLEMENTATION_PACKET.md)
+- [Slice 1B-3 Codex 独立验收](reviews/SLICE_1B3_CODEX_ACCEPTANCE_REVIEW.md)
+- [Slice 1B 统一 OCR 修复任务包](PART_1_SLICE_1B_OCR_FIX_PACKET.md)
+- [Slice 1B 统一 OCR Review](reviews/SLICE_1B_OCR_REVIEW.md)
 - [Stage 4 过程复盘](../04-platform-stage-4-practice-memory-and-review/STAGE_4_WORKING_RETROSPECTIVE.md)
 - [Stage 4 Slice 5 完成总结](../04-platform-stage-4-practice-memory-and-review/SLICE_5_SUMMARY.md)
 - [Self-host 开发路线](../SELF_HOST_DEVELOPMENT_ROADMAP.md)
