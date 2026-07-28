@@ -427,6 +427,122 @@ export async function fetchAgentRun(workspaceId: string, runId: string, signal?:
   return request<AgentRunDetail>(`/api/v1/workspaces/${workspaceId}/agent-runs/${runId}`, { signal });
 }
 
+// ---------------------------------------------------------------------------
+// Stage 5 Slice 1C: Quality & Cost Summary
+// ---------------------------------------------------------------------------
+
+export type QualityCostWindow = "24h" | "7d" | "30d";
+export type QualityCostBusinessType = "course_generation" | "tutor" | "practice" | "code_execution" | "unknown";
+export type QualityCostStatus = "started" | "succeeded" | "failed" | "canceled";
+
+export interface QualityCostFilters {
+  role: string | null;
+  status: string | null;
+  business_type: string | null;
+}
+
+export interface RunDurationMs {
+  p50: number | null;
+  p95: number | null;
+  sample_count: number;
+}
+
+export interface RunByStatus {
+  started: number;
+  succeeded: number;
+  failed: number;
+  canceled: number;
+}
+
+export interface RunErrorEntry {
+  error_code: string;
+  count: number;
+}
+
+export interface RunSummaryData {
+  total: number;
+  by_status: RunByStatus;
+  duration_ms: RunDurationMs;
+  errors: RunErrorEntry[];
+}
+
+export interface ProviderCallByStatus {
+  status: string;
+  count: number;
+}
+
+export interface ProviderCallSummaryData {
+  total: number;
+  by_status: ProviderCallByStatus[];
+  input_tokens: number;
+  output_tokens: number;
+  usage_complete_count: number;
+  usage_unknown_count: number;
+}
+
+export interface CostUnknownByReason {
+  reason: string;
+  count: number;
+}
+
+export interface CostSummaryData {
+  currency: "CNY";
+  known_amount: string;
+  calculated_call_count: number;
+  unknown_call_count: number;
+  unknown_by_reason: CostUnknownByReason[];
+  runs_without_provider_calls: number;
+}
+
+export interface QualityCostSummary {
+  window: QualityCostWindow;
+  from: string;
+  to: string;
+  filters: QualityCostFilters;
+  runs: RunSummaryData;
+  provider_calls: ProviderCallSummaryData;
+  cost: CostSummaryData;
+}
+
+export interface QualityCostQuery {
+  window?: QualityCostWindow;
+  role?: AgentRunRole;
+  status?: QualityCostStatus;
+  business_type?: QualityCostBusinessType;
+}
+
+export async function fetchQualityCostSummary(workspaceId: string, query: QualityCostQuery = {}, signal?: AbortSignal): Promise<QualityCostSummary> {
+  const params = new URLSearchParams();
+  if (query.window) params.set("window", query.window);
+  if (query.role) params.set("role", query.role);
+  if (query.status) params.set("status", query.status);
+  if (query.business_type) params.set("business_type", query.business_type);
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  return request<QualityCostSummary>(`/api/v1/workspaces/${workspaceId}/quality-cost-summary${suffix}`, { signal });
+}
+
+// Provider Call read API (Slice 1B-3) for drill-down
+export interface ProviderCallRead {
+  id: string;
+  owner: { kind: "agent_run" | "rag_answer" | "workspace"; agent_run_id: string | null; rag_answer_trace_id: string | null };
+  ordinal: number;
+  phase: string;
+  provider: string;
+  model: string;
+  status: string;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  latency_ms: number | null;
+  error_code: string | null;
+  started_at: string;
+  completed_at: string | null;
+  cost: { currency: "CNY"; status: "calculated" | "unknown"; amount: string | null; unknown_reason: string | null };
+}
+
+export async function fetchProviderCalls(workspaceId: string, agentRunId: string, signal?: AbortSignal): Promise<ProviderCallRead[]> {
+  return request<ProviderCallRead[]>(`/api/v1/workspaces/${workspaceId}/provider-calls?agent_run_id=${encodeURIComponent(agentRunId)}&limit=50`, { signal });
+}
+
 export type PracticeItemType = "single_choice" | "short_answer" | "coding" | "scientific";
 export type PracticeDifficulty = "easy" | "standard" | "hard";
 

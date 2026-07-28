@@ -17,6 +17,8 @@ from learn_platform_api.db.models import (
     TutorTurn,
 )
 
+from learn_platform_api.services.agent_run_identity import owner_kind_from_run
+
 # Code Lab languages that are safe to surface. Abnormal historical values
 # (e.g. "ruby", "go") are not exposed and return null instead.
 SAFE_CODE_LANGUAGES = {"python", "java", "cpp"}
@@ -43,7 +45,7 @@ def _identity(db: Session, run: AgentRun) -> dict[str, object]:
     view can show "已删除" without reviving content.
     """
     identity: dict[str, object] = {
-        "kind": "unknown",
+        "kind": owner_kind_from_run(run),
         "job_type": None,
         "course_id": None,
         "course_title": None,
@@ -55,7 +57,6 @@ def _identity(db: Session, run: AgentRun) -> dict[str, object]:
     }
 
     if run.course_generation_job_id is not None:
-        identity["kind"] = "course_generation"
         job = db.get(CourseGenerationJob, run.course_generation_job_id)
         if job is None or job.workspace_id != run.workspace_id:
             identity["course_deleted"] = True
@@ -82,7 +83,6 @@ def _identity(db: Session, run: AgentRun) -> dict[str, object]:
         return identity
 
     if run.tutor_turn_id is not None:
-        identity["kind"] = "tutor"
         turn = db.get(TutorTurn, run.tutor_turn_id)
         if turn is None or turn.workspace_id != run.workspace_id:
             identity["course_deleted"] = True
@@ -115,7 +115,6 @@ def _identity(db: Session, run: AgentRun) -> dict[str, object]:
         return identity
 
     if run.practice_job_id is not None:
-        identity["kind"] = "practice"
         job = db.get(PracticeJob, run.practice_job_id)
         if job is None or job.workspace_id != run.workspace_id:
             identity["course_deleted"] = True
@@ -125,9 +124,16 @@ def _identity(db: Session, run: AgentRun) -> dict[str, object]:
         lesson_id = job.lesson_id
         if course_id is None and job.practice_attempt_id:
             # Grading jobs resolve their course/lesson through the attempt chain.
+            # Fix 5: Validate workspace on each intermediate object.
             attempt = db.get(PracticeAttempt, job.practice_attempt_id)
-            item = db.get(PracticeItem, attempt.practice_item_id) if attempt else None
-            practice_set = db.get(PracticeSet, item.practice_set_id) if item else None
+            if attempt is None or attempt.workspace_id != run.workspace_id:
+                identity["course_deleted"] = True
+                return identity
+            item = db.get(PracticeItem, attempt.practice_item_id)
+            if item is None or item.workspace_id != run.workspace_id:
+                identity["course_deleted"] = True
+                return identity
+            practice_set = db.get(PracticeSet, item.practice_set_id)
             if practice_set and practice_set.workspace_id == run.workspace_id:
                 course_id = practice_set.course_id
                 lesson_id = practice_set.lesson_id
@@ -149,7 +155,6 @@ def _identity(db: Session, run: AgentRun) -> dict[str, object]:
         return identity
 
     if run.code_lab_job_id is not None:
-        identity["kind"] = "code_execution"
         job = db.get(CodeLabJob, run.code_lab_job_id)
         if job is None or job.workspace_id != run.workspace_id:
             identity["course_deleted"] = True

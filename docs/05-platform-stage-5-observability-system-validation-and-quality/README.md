@@ -58,6 +58,9 @@ Postgres 备份恢复、Qdrant 重建 runbook、storage reconciliation、Redis/Q
 - [Slice 1B-3 Codex 独立验收](reviews/SLICE_1B3_CODEX_ACCEPTANCE_REVIEW.md)
 - [Slice 1B 统一 OCR 修复任务包](PART_1_SLICE_1B_OCR_FIX_PACKET.md)
 - [Slice 1B 统一 OCR Review](reviews/SLICE_1B_OCR_REVIEW.md)
+- [Slice 1C Spec：Workspace 质量与成本读取体验](specs/005-workspace-quality-cost-read-experience.md)（已接受）
+- [Slice 1C 前端概念与状态矩阵](PART_1_SLICE_1C_FRONTEND_CONCEPT.md)（已接受）
+- [Slice 1C GLM 实现任务包](PART_1_SLICE_1C_GLM_IMPLEMENTATION_PACKET.md)
 - [Stage 4 过程复盘](../04-platform-stage-4-practice-memory-and-review/STAGE_4_WORKING_RETROSPECTIVE.md)
 - [Stage 4 Slice 5 完成总结](../04-platform-stage-4-practice-memory-and-review/SLICE_5_SUMMARY.md)
 - [Self-host 开发路线](../SELF_HOST_DEVELOPMENT_ROADMAP.md)
@@ -92,5 +95,5 @@ Postgres 备份恢复、Qdrant 重建 runbook、storage reconciliation、Redis/Q
 
 ## 开始实现前
 
-第一部分事实盘点和“运行摘要合同补全”Slice 1A 已完成。Slice 1B/1C 仍未批准，
-不得提前实现。
+第一部分 Slice 1A 与 Slice 1B 已完成；Slice 1C Spec 和前端概念已接受，可以
+按正式 GLM 实现任务包执行。不得提前进入 Stage 5 第二部分。

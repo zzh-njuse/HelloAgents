@@ -13,7 +13,10 @@ import {
   fetchCourses
 } from "../lib/api";
 
+import { QualityCostPanel } from "./QualityCostPanel";
+
 type LoadState = "loading" | "ready" | "error";
+type RunsTab = "runs" | "quality-cost";
 
 const ROLE_LABEL: Record<AgentRunRole, string> = {
   course_architect: "课程架构",
@@ -131,6 +134,9 @@ function formatTimestamp(value: string): string {
 }
 
 export function AgentRunsPanel({ workspaceId }: { workspaceId: string }) {
+  const [activeTab, setActiveTab] = useState<RunsTab>("runs");
+  const runsTabRef = useRef<HTMLButtonElement>(null);
+  const qualityCostTabRef = useRef<HTMLButtonElement>(null);
   const [courses, setCourses] = useState<Course[]>([]);
   const [runs, setRuns] = useState<AgentRunSummary[]>([]);
   const [filterCourse, setFilterCourse] = useState("");
@@ -279,6 +285,65 @@ export function AgentRunsPanel({ workspaceId }: { workspaceId: string }) {
         </button>
       </div>
 
+      <div className="runs-tabs" role="tablist" aria-label="运行记录视图" onKeyDown={(e) => {
+        const tabs: RunsTab[] = ["runs", "quality-cost"];
+        const refs = [runsTabRef, qualityCostTabRef];
+        const idx = tabs.indexOf(activeTab);
+        let targetIdx: number | null = null;
+        if (e.key === "ArrowRight" || e.key === "ArrowDown") {
+          e.preventDefault();
+          targetIdx = (idx + 1) % tabs.length;
+        } else if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
+          e.preventDefault();
+          targetIdx = (idx - 1 + tabs.length) % tabs.length;
+        } else if (e.key === "Home") {
+          e.preventDefault();
+          targetIdx = 0;
+        } else if (e.key === "End") {
+          e.preventDefault();
+          targetIdx = tabs.length - 1;
+        }
+        if (targetIdx !== null) {
+          setActiveTab(tabs[targetIdx]);
+          refs[targetIdx].current?.focus();
+        }
+      }}>
+        <button
+          id="runs-tab"
+          ref={runsTabRef}
+          role="tab"
+          aria-selected={activeTab === "runs"}
+          aria-controls="runs-tab-panel"
+          tabIndex={activeTab === "runs" ? 0 : -1}
+          className={activeTab === "runs" ? "active" : ""}
+          onClick={() => setActiveTab("runs")}
+          type="button"
+        >
+          运行记录
+        </button>
+        <button
+          id="quality-cost-tab"
+          ref={qualityCostTabRef}
+          role="tab"
+          aria-selected={activeTab === "quality-cost"}
+          aria-controls="quality-cost-tab-panel"
+          tabIndex={activeTab === "quality-cost" ? 0 : -1}
+          className={activeTab === "quality-cost" ? "active" : ""}
+          onClick={() => setActiveTab("quality-cost")}
+          type="button"
+        >
+          质量与成本
+        </button>
+      </div>
+
+      {activeTab === "quality-cost" ? (
+        <div id="quality-cost-tab-panel" role="tabpanel" aria-labelledby="quality-cost-tab">
+          <QualityCostPanel workspaceId={workspaceId} />
+        </div>
+      ) : null}
+
+      {activeTab === "runs" ? (
+      <div id="runs-tab-panel" role="tabpanel" aria-labelledby="runs-tab">
       <div className="runs-filters">
         <label>
           课程
@@ -379,6 +444,8 @@ export function AgentRunsPanel({ workspaceId }: { workspaceId: string }) {
             );
           })}
         </ul>
+      ) : null}
+      </div>
       ) : null}
     </section>
   );
