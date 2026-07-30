@@ -33,6 +33,13 @@ export function TutorPanel({ workspaceId, reader, lessonId, onLessonId, onManage
   // value for Tutor (it is not a coding-specific capability) and interacted
   // poorly with practice focus mode. No replacement Tutor full-screen in this round.
   const turnIdempotencyKey = useRef<string | null>(null);
+  // Fix 6.2: guards that stop a stale fetch (from an older workspace/course, or
+  // landing after unmount) from overwriting the current Tutor state. These refs
+  // are intentionally not part of any effect dependency array, so they add no
+  // dependency cycle.
+  const mountedRef = useRef(true);
+  const activeContextRef = useRef({ workspaceId, courseId: reader.course.id, versionId: reader.version.id });
+  activeContextRef.current = { workspaceId, courseId: reader.course.id, versionId: reader.version.id };
 
   const refreshCapabilities = useCallback(async (signal?: AbortSignal) => {
     const response = await fetch(`${import.meta.env.VITE_API_BASE_URL ?? ""}/api/v1/workspaces/${workspaceId}/mcp-capabilities`, { signal });
@@ -71,8 +78,33 @@ export function TutorPanel({ workspaceId, reader, lessonId, onLessonId, onManage
     };
   }, [refreshCapabilities, workspaceId]);
 
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
+
+  // Fix 6.1: when a capability goes ready -> unavailable, its per-Turn
+  // authorization is cleared so the toggle can never be disabled-but-checked.
+  useEffect(() => { if (!scienceToolAvailable) setScienceToolAuthorized(false); }, [scienceToolAvailable]);
+  useEffect(() => { if (!codeToolAvailable) setCodeToolAuthorized(false); }, [codeToolAvailable]);
+
   const refreshSessions = useCallback(async () => {
-    const items = await fetchTutorSessions(workspaceId, reader.course.id, reader.version.id);
+    // Fix 6.2: capture the context this fetch belongs to. A response that lands
+    // after the workspace/course changed — or after unmount — is dropped instead
+    // of overwriting the current state, and a stale fetch's failure is swallowed.
+    const context = { workspaceId, courseId: reader.course.id, versionId: reader.version.id };
+    const stale = () => !mountedRef.current
+      || activeContextRef.current.workspaceId !== context.workspaceId
+      || activeContextRef.current.courseId !== context.courseId
+      || activeContextRef.current.versionId !== context.versionId;
+    let items: TutorSession[];
+    try {
+      items = await fetchTutorSessions(context.workspaceId, context.courseId, context.versionId);
+    } catch (value) {
+      if (stale()) return;
+      throw value;
+    }
+    if (stale()) return;
     setSessions(items);
     setSession((current) => items.find((item) => item.id === current?.id) ?? items[0] ?? null);
   }, [reader.course.id, reader.version.id, workspaceId]);
@@ -98,20 +130,47 @@ export function TutorPanel({ workspaceId, reader, lessonId, onLessonId, onManage
   }, [lessonId, scope, workspaceId]);
 
   useEffect(() => {
+    // Fix 6.2: drop late results from an older workspace/course/scope or after
+    // unmount so they never overwrite the current memory/completion state.
+    let cancelled = false;
     void Promise.all([fetchLearningMemories(workspaceId), fetchLessonCompletions(workspaceId, reader.course.id), fetchMemoryPolicy(workspaceId)])
       .then(([memories, completions, policy]) => {
+        if (cancelled) return;
         setMemoryEnabled(policy.tutor_use_enabled);
         setMemoryCount(policy.tutor_use_enabled ? memories.filter((memory) => memory.status === "active" && memory.course_id === reader.course.id && (scope === "course" || memory.lesson_id === lessonId)).slice(0, 5).length : 0);
         setCompletionCount(policy.tutor_use_enabled ? completions.filter((completion) => completion.course_version_id === reader.version.id && (scope === "course" || completion.lesson_version_id === selectedLesson?.version.id)).slice(0, 10).length : 0);
       })
-      .catch((value) => setError(errorMessage(value)));
+      .catch((value) => { if (!cancelled) setError(errorMessage(value)); });
+    return () => { cancelled = true; };
   }, [lessonId, reader.course.id, reader.version.id, scope, selectedLesson?.version.id, workspaceId]);
   useEffect(() => {
     if (!sessionId || !latestTurnId || !latestTurnStatus || !active(latestTurnStatus)) return;
+    // Slice 2B Batch B: the EventSource is opened only once React observes the
+    // active Turn. If the worker finishes before that, the completion event is
+    // lost and the page would stay on a queued/running snapshot. The polling
+    // below is a bounded fallback over the authoritative session; the SSE
+    // channel above remains the primary live update path.
+    // `cancelled` is the request-sequence guard: it is flipped in cleanup, so a
+    // response that lands after the session/turn/workspace changed (or after
+    // unmount / terminal state) is discarded instead of overwriting new state.
+    let cancelled = false;
+    const refresh = () => void fetchTutorSession(workspaceId, sessionId)
+      .then((next) => { if (!cancelled) setSession(next); })
+      .catch(() => undefined);
     const source = new EventSource(tutorTurnEventsUrl(workspaceId, latestTurnId));
-    const refresh = () => void fetchTutorSession(workspaceId, sessionId).then(setSession).catch(() => undefined);
     ["turn.started", "turn.progress", "answer.delta", "citation.available", "turn.completed", "turn.failed", "turn.canceled"].forEach((name) => source.addEventListener(name, refresh));
-    return () => source.close();
+    refresh();                                        // immediate refresh on entering active state
+    const timer = window.setInterval(refresh, 2_500);  // short-interval fallback poll
+    // Explicit wall-time bound: stop polling even if the Turn never reaches a
+    // terminal state we observe. The SSE channel keeps running regardless, and
+    // the effect tears down on terminal/session/turn/workspace change/unmount.
+    const hardStop = window.setTimeout(() => window.clearInterval(timer), 120_000);
+    return () => {
+      cancelled = true;
+      source.close();
+      window.clearInterval(timer);
+      window.clearTimeout(hardStop);
+    };
   }, [latestTurnId, latestTurnStatus, sessionId, workspaceId]);
 
   const submit = async (event: FormEvent) => {
@@ -133,12 +192,19 @@ export function TutorPanel({ workspaceId, reader, lessonId, onLessonId, onManage
       }
       const selected = selectedLesson;
       turnIdempotencyKey.current ??= crypto.randomUUID();
+      const idempotencyKey = turnIdempotencyKey.current;
       const turnPayload = scope === "course"
         ? { question: question.trim(), scope, science_tool_authorized: scienceToolAuthorized, code_tool_authorized: codeToolAuthorized, code_run_id: codeRunId ?? undefined }
         : { question: question.trim(), scope, section_id: selected?.section.id, lesson_id: selected?.lesson.id, lesson_version_id: selected?.version.id, science_tool_authorized: scienceToolAuthorized, code_tool_authorized: codeToolAuthorized, code_run_id: codeRunId ?? undefined };
-      await createTutorTurn(workspaceId, current.id, turnPayload, turnIdempotencyKey.current);
+      await createTutorTurn(workspaceId, current.id, turnPayload, idempotencyKey);
+      // Fix 6.3: consume/clear the key the moment createTutorTurn succeeds — the
+      // server has now bound it to this Turn. Clearing before the session read
+      // means a later read failure can never make the next submit reuse an
+      // already-consumed key. If createTutorTurn threw above, the catch keeps the
+      // key so the same user action can safely retry.
+      turnIdempotencyKey.current = null;
       setSession(await fetchTutorSession(workspaceId, current.id));
-      turnIdempotencyKey.current = null; setQuestion(""); setScienceToolAuthorized(false); setCodeToolAuthorized(false);
+      setQuestion(""); setScienceToolAuthorized(false); setCodeToolAuthorized(false);
       // Per §4.3: code_run_id is consumed after send — next Turn does not inherit
       onCodeRunConsumed?.();
       await refreshSessions();

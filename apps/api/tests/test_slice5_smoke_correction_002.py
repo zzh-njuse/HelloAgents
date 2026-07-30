@@ -1369,6 +1369,8 @@ def test_safe_position_summary_called_in_repair_path(db_session, monkeypatch) ->
         "Repair prompt should contain language='java' from _build_safe_position_summary"
     assert "compile_error" in prompt_text, \
         "Repair prompt should contain compile_error category from _build_safe_position_summary"
+    assert "passed=0/3" in prompt_text, \
+        "Repair prompt should preserve the safe pass count from the real validation result"
 
 
 def test_repair_prompt_uses_minimal_dto_schema(db_session, monkeypatch) -> None:
@@ -1992,9 +1994,9 @@ def test_scientific_spec_missing_routes_to_specialized_repair(db_session, monkey
     3. The repair provider returns a minimal ScientificReferenceRepairArtifact
        DTO (new local spec + reference_answer; no full Item, no immutable
        fields).
-    4. _merge_minimal_scientific_repair merges, re-validation passes locally
-       (no Wolfram), the final full-validation gate passes, and _commit_set
-       persists the normalized scientific item.
+    4. Because the Job requires science, the repair DTO carries a mandatory
+       remote boolean expression. A controlled verifier accepts it, the final
+       full-validation gate passes, and _commit_set persists the item.
     5. No AttributeError; no stable error residue on the succeeded Job.
     """
     from learn_platform_api.services import practice_generation
@@ -2022,14 +2024,14 @@ def test_scientific_spec_missing_routes_to_specialized_repair(db_session, monkey
         _make_single_choice_item("q3"),
         scientific_no_spec,
     ]}
-    # Minimal scientific repair DTO: brand-new LOCAL spec (no remote
-    # verification -> no Wolfram) + reference_answer. No full Item, no immutable
-    # fields (rubric/stem/citation_ids are forbidden in the DTO).
+    # Minimal scientific repair DTO: required-science mode makes the remote
+    # expression and true flag structural requirements of the repair schema.
     repair_dto = {
         "item_key": "q4",
         "scientific_answer_spec": {
             "normalized_answer": "9.81", "equivalence_rule": "numeric_tolerance",
-            "tolerance": 0.01, "unit": "m/s^2", "needs_remote_verification": False,
+            "tolerance": 0.01, "unit": "m/s^2", "needs_remote_verification": True,
+            "verification_expression": "Abs(9.81 - 9.81) <= 0.01",
         },
         "reference_answer": "g = 9.81 m/s^2",
     }
@@ -2049,6 +2051,15 @@ def test_scientific_spec_missing_routes_to_specialized_repair(db_session, monkey
         (repair_dto, {"input_tokens": 50, "output_tokens": 50}),
     ])
     monkeypatch.setattr(practice_generation, "call_practice_provider", counting_provider)
+    from learn_platform_api.services.science_tool_service import ScienceToolResult
+    monkeypatch.setattr(
+        "learn_platform_api.services.science_tool_service.execute_science_verification",
+        lambda **_kwargs: ScienceToolResult(
+            success=True,
+            observation={"verified": True},
+            latency_ms=1,
+        ),
+    )
 
     # Must NOT raise (in particular, not an AttributeError from spec.unit).
     practice_generation.execute_generation(db_session, get_settings(), job, worker_id="worker-c002")

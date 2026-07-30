@@ -1,0 +1,273 @@
+# Slice 2B Batch B controlled system-test override.
+#
+# Layered on docker-compose.yml (`-f docker-compose.yml -f compose.system-test.yml`).
+# Every service that makes provider/embedding/MCP calls is redirected to the
+# controlled stubs/fakes: providers+embeddings -> model-services-stub; code
+# execution -> mcp-execution -> fake-execution-backend (NOT Judge0); science ->
+# fake-wolfram (NOT agenttools.wolfram.com). The API never receives a Wolfram
+# key (packet §5.4); only the workers/probe get a test-only placeholder. No real
+# secret name/value or remote default URL remains (packet §5.10).
+services:
+  postgres:
+    ports: !reset []
+    volumes:
+      - system_test_postgres:/var/lib/postgresql/data
+
+  redis:
+    ports: !reset []
+    volumes:
+      - system_test_redis:/data
+
+  qdrant:
+    ports: !reset []
+    volumes:
+      - system_test_qdrant:/qdrant/storage
+
+  model-services-stub:
+    build:
+      context: .
+      dockerfile: tests/system/model_services_stub/Dockerfile
+    environment:
+      STUB_PORT: "8090"
+      STUB_TIMEOUT_SECONDS: "5"
+    healthcheck:
+      test:
+        ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8090/readyz', timeout=2)"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+    ports:
+      - "127.0.0.1:${SYSTEM_TEST_STUB_PORT:-18091}:8090"
+
+  # Test-only fake execution backend (real local toolchain; NOT Judge0).
+  fake-execution-backend:
+    build:
+      context: .
+      dockerfile: tests/system/fake_execution_backend/Dockerfile
+    environment:
+      FAKE_EXEC_PORT: "8110"
+    healthcheck:
+      test:
+        ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8110/readyz', timeout=2)"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+    ports:
+      - "127.0.0.1:${SYSTEM_TEST_FAKE_EXEC_PORT:-18092}:8110"
+    networks:
+      - default
+      - mcp-execution-net
+
+  # Test-only fake Wolfram MCP server (pinned protocol 2025-03-26; NOT Wolfram Cloud).
+  fake-wolfram:
+    build:
+      context: .
+      dockerfile: tests/system/fake_wolfram_server/Dockerfile
+    environment:
+      FAKE_WOLFRAM_PORT: "8120"
+    healthcheck:
+      test:
+        ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8120/readyz', timeout=2)"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+    ports:
+      - "127.0.0.1:${SYSTEM_TEST_FAKE_WOLFRAM_PORT:-18093}:8120"
+    networks:
+      - default
+
+  # Product MCP execution adapter -> fake execution backend only.
+  mcp-execution:
+    environment:
+      EXECUTION_BACKEND_URL: http://fake-execution-backend:8110
+      EXECUTION_BACKEND_TIMEOUT_SECONDS: "15"
+      MCP_EXECUTION_PORT: "8100"
+    healthcheck:
+      test:
+        ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8100/readyz', timeout=3)"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    depends_on:
+      fake-execution-backend:
+        condition: service_healthy
+
+  api:
+    environment: &system_test_environment
+      ENVIRONMENT: test
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-hello_agents}:${POSTGRES_PASSWORD:-hello_agents}@postgres:5432/${POSTGRES_DB:-hello_agents}
+      REDIS_URL: redis://redis:6379/0
+      QDRANT_URL: http://qdrant:6333
+      STORAGE_ROOT: /app/storage
+      PRODUCT_GENERATION_PROVIDER: deepseek
+      PRODUCT_GENERATION_MODEL: stub-success
+      PRODUCT_GENERATION_BASE_URL: http://model-services-stub:8090
+      PRODUCT_GENERATION_API_KEY: system-test-generation-key
+      PRODUCT_GENERATION_THINKING: "false"
+      PRODUCT_EMBEDDING_PROVIDER: dashscope
+      PRODUCT_EMBEDDING_MODEL: stub-embedding
+      PRODUCT_EMBEDDING_BASE_URL: http://model-services-stub:8090/embeddings
+      PRODUCT_EMBEDDING_API_KEY: system-test-embedding-key
+      PRODUCT_EMBEDDING_DIMENSION: "4"
+      PRODUCT_RAG_MIN_SCORE: "0.50"
+      PRODUCT_RAG_DEFAULT_TOP_K: "5"
+      PRODUCT_GENERATION_TIMEOUT_SECONDS: "30"
+      PRACTICE_GENERATION_MODEL: deepseek-v4-pro
+      # API only reads capability projections; it does NOT call MCP and does NOT
+      # receive a Wolfram key (packet §5.4).
+      MCP_EXECUTION_ADAPTER_URL: http://mcp-execution:8100
+      WOLFRAM_MCP_ENABLED: "true"
+      WOLFRAM_MCP_URL: http://fake-wolfram:8120
+      WOLFRAM_MCP_API_KEY: ""
+    ports: !reset []
+    volumes:
+      - system_test_storage:/app/storage
+    depends_on:
+      model-services-stub:
+        condition: service_healthy
+
+  web:
+    ports: !override
+      - "127.0.0.1:${SYSTEM_TEST_WEB_PORT:-18080}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+
+  # Capability probe: performs the REAL MCP handshakes against mcp-execution and
+  # fake-wolfram and writes ready projections (with real verified schema hashes).
+  capability-probe:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+      target: runtime
+    command: ["python", "-m", "learn_platform_api.capability_probe"]
+    environment:
+      <<: *system_test_environment
+      MCP_EXECUTION_ADAPTER_URL: http://mcp-execution:8100
+      WOLFRAM_MCP_ENABLED: "true"
+      WOLFRAM_MCP_URL: http://fake-wolfram:8120
+      WOLFRAM_MCP_API_KEY: system-test-wolfram-key
+      CAPABILITY_PROBE_INTERVAL_SECONDS: "5"
+      CAPABILITY_PROBE_TTL_SECONDS: "30"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mcp-execution:
+        condition: service_healthy
+      fake-wolfram:
+        condition: service_healthy
+    networks:
+      - default
+      - mcp-execution-net
+
+  tutor-system-worker:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+      target: runtime
+    command:
+      ["rq", "worker", "--url", "redis://redis:6379/0", "learn-platform-tutor"]
+    environment:
+      <<: *system_test_environment
+      # Workers/probe that need Wolfram get a test-only placeholder key (§5.4).
+      WOLFRAM_MCP_API_KEY: system-test-wolfram-key
+    volumes:
+      - system_test_storage:/app/storage
+    depends_on:
+      api:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      model-services-stub:
+        condition: service_healthy
+      mcp-execution:
+        condition: service_healthy
+      fake-wolfram:
+        condition: service_healthy
+    networks:
+      - default
+      - mcp-execution-net
+
+  practice-worker:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+      target: runtime
+    command:
+      ["rq", "worker", "--url", "redis://redis:6379/0", "learn-platform-practice"]
+    environment:
+      <<: *system_test_environment
+      WOLFRAM_MCP_API_KEY: system-test-wolfram-key
+    volumes:
+      - system_test_storage:/app/storage
+    depends_on:
+      api:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      model-services-stub:
+        condition: service_healthy
+      mcp-execution:
+        condition: service_healthy
+      fake-wolfram:
+        condition: service_healthy
+    networks:
+      - default
+      - mcp-execution-net
+
+  system-test-runner:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+      target: test
+    command:
+      ["python", "-m", "pytest", "-q", "tests/system/test_practice_vertical.py", "tests/system/test_tutor_tools_vertical.py", "--junitxml=/test-results/system.xml"]
+    environment:
+      <<: *system_test_environment
+      SYSTEM_TEST_API_URL: http://api:8000
+      SYSTEM_TEST_STUB_URL: http://model-services-stub:8090
+      SYSTEM_TEST_FAKE_EXEC_URL: http://fake-execution-backend:8110
+      SYSTEM_TEST_FAKE_WOLFRAM_URL: http://fake-wolfram:8120
+    volumes:
+      - ./tests/system:/app/apps/api/tests/system:ro
+      - system_test_results:/test-results
+    depends_on:
+      api:
+        condition: service_healthy
+      practice-worker:
+        condition: service_started
+      tutor-system-worker:
+        condition: service_started
+      capability-probe:
+        condition: service_started
+    networks:
+      - default
+      - mcp-execution-net
+
+  # Base dev services that are NOT part of the controlled system test carry real
+  # keys/URLs from the dev .env. Exclude them from the test run via a profile and
+  # neutralise their env (the anchor is defined above on `api`) so NO real secret
+  # or remote URL remains in the resolved test environment (§5.10 / §10).
+  worker:
+    profiles: ["legacy-base-excluded"]
+    environment: *system_test_environment
+  code-lab-worker:
+    profiles: ["legacy-base-excluded"]
+    environment: *system_test_environment
+  reconciler:
+    profiles: ["legacy-base-excluded"]
+    environment: *system_test_environment
+
+volumes:
+  system_test_postgres:
+  system_test_redis:
+  system_test_qdrant:
+  system_test_storage:
+  system_test_results:
+
+networks:
+  mcp-execution-net:
+    driver: bridge
+    internal: false

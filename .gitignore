@@ -175,6 +175,8 @@ apps/api/.pytest-tmp*/
 /apps/web/node_modules/
 /apps/web/dist/
 /apps/web/*.tsbuildinfo
+/apps/web/playwright-report/
+/apps/web/test-results/
 
 # Local audit, editor, and scratch artifacts
 /.backups/

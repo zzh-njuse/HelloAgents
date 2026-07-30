@@ -1,5 +1,10 @@
 # Platform Stage 5：可观测、系统验证与质量优化
 
+- [Slice 2A Spec：受控纵向系统测试与 CI Gate](specs/006-controlled-system-tests-and-ci-gates.md)（已接受）
+- [ADR 003：受控测试边界与 CI Gate 分离](adr/003-controlled-test-boundaries-and-ci-gate-separation.md)（已接受）
+- [ADR 004：业务回滚后的 Provider Call 事实持久化](adr/004-durable-provider-call-facts-across-business-rollback.md)（已接受）
+- [Slice 2A 环境与实现路径预检](PART_2_SLICE_2A_ENVIRONMENT_PREFLIGHT.md)
+
 状态：顶层方向已通过人工 Gate；Slice 1A 已于 2026-07-27 完成实现、独立验收、
 浏览器 smoke 和 OCR；Slice 1B-1/1B-2/1B-3 已通过独立验收和统一 OCR
 
@@ -61,6 +66,17 @@ Postgres 备份恢复、Qdrant 重建 runbook、storage reconciliation、Redis/Q
 - [Slice 1C Spec：Workspace 质量与成本读取体验](specs/005-workspace-quality-cost-read-experience.md)（已接受）
 - [Slice 1C 前端概念与状态矩阵](PART_1_SLICE_1C_FRONTEND_CONCEPT.md)（已接受）
 - [Slice 1C GLM 实现任务包](PART_1_SLICE_1C_GLM_IMPLEMENTATION_PACKET.md)
+- [第二部分事实盘点：CI 与系统测试](PART_2_CI_SYSTEM_TEST_FACT_INVENTORY.md)
+- [第二部分候选 Slice 计划](PART_2_CANDIDATE_SLICE_PLAN.md)
+- [Slice 2A Spec：受控纵向系统测试与 CI Gate](specs/006-controlled-system-tests-and-ci-gates.md)（已接受）
+- [ADR 003：受控测试边界与 CI Gate 分离](adr/003-controlled-test-boundaries-and-ci-gate-separation.md)（已接受）
+- [ADR 004：业务回滚后的 Provider Call 事实持久化](adr/004-durable-provider-call-facts-across-business-rollback.md)（已接受）
+- [Slice 2A Provider Call 持久化修复任务包](PART_2_SLICE_2A_DURABLE_PROVIDER_CALL_GLM_PACKET.md)
+- [Slice 2A OCR Review](reviews/SLICE_2A_OCR_REVIEW.md)
+- [Slice 2B Spec：高风险工具调用与练习质量基线](specs/007-high-risk-tool-and-practice-quality-baseline.md)（已接受）
+- [Slice 2B GLM 实现任务包](PART_2_SLICE_2B_GLM_IMPLEMENTATION_PACKET.md)（首次只执行 Batch A）
+- [Slice 2B Batch B GLM 实现任务包](PART_2_SLICE_2B_BATCH_B_GLM_PACKET.md)（受控纵向流程与 CI）
+- [Slice 2B 真实 Provider / Judge0 / Wolfram Gate](reviews/SLICE_2B_REAL_REMOTE_GATE_REVIEW.md)（失败；成本保护停止）
 - [Stage 4 过程复盘](../04-platform-stage-4-practice-memory-and-review/STAGE_4_WORKING_RETROSPECTIVE.md)
 - [Stage 4 Slice 5 完成总结](../04-platform-stage-4-practice-memory-and-review/SLICE_5_SUMMARY.md)
 - [Self-host 开发路线](../SELF_HOST_DEVELOPMENT_ROADMAP.md)

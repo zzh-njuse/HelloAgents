@@ -13,6 +13,11 @@ from academic_companion.course_agents import CourseAgentRequest, CourseOutlineAr
 from learn_platform_api.db.models import AgentRun, AgentToolCall, Course, CourseGenerationJob, CourseGenerationJobSource, CourseSection, CourseSectionCitation, CourseVersion, CourseVersionSource, JobToolAuthorization, Lesson, LessonCitation, LessonVersion, SourceDocument, DocumentChunk, DocumentVersion, Workspace
 from learn_platform_api.services.retrieval import retrieve
 from learn_platform_api.services.provider_call_recorder import record_provider_call, COURSE_PHASES
+from learn_platform_api.services.remote_tool_call_recorder import (
+    RemoteToolCallRecorder,
+    TOOL_BUDGET_EXCEEDED,
+    ensure_course_job_tool_authorization,
+)
 from learn_platform_api.settings import Settings
 
 
@@ -170,32 +175,34 @@ def _lesson_evidence_search(db: Session, settings: Settings, job: CourseGenerati
 
 
 def _execute_lesson_generation(db: Session, settings: Settings, job: CourseGenerationJob, request: CourseAgentRequest) -> None:
+    # Fix 3 / ADR 004 S5.1: Create and commit the minimal AgentRun owner
+    # BEFORE any business half-products (JobToolAuthorization, LessonVersion,
+    # Citation, etc.) so the owner commit does not accidentally persist them.
+    run = AgentRun(course_generation_job_id=job.id, workspace_id=job.workspace_id, role="lesson_writer", attempt_number=job.attempt_count, status="running")
+    db.add(run)
+    db.flush()
+    db.commit()
+
     # Slice 4 packet 002: Create JobToolAuthorization for science verification
     # if the CourseGenerationJob has science_tool_authorized=True (Spec 004 §9).
     # This creates a per-Job authorization with budget tracking.
-    science_auth = None
+    # Created AFTER the AgentRun owner commit so it is not swept into the
+    # owner transaction (Fix 3).
+    science_auth: dict[str, Any] | None = None
     if getattr(job, 'science_tool_authorized', False) and settings.wolfram_mcp_enabled:
         from learn_platform_api.services.readiness import _read_capability_projection
         projection = _read_capability_projection(db, "science_computation")
         if projection is not None and projection.get("ok"):
             verified_hash = projection.get("verified_schema_hash", "")
-            science_auth = JobToolAuthorization(
-                id=f"jta-{job.id}-science",
-                workspace_id=job.workspace_id,
-                capability_id="science_computation",
-                course_generation_job_id=job.id,
-                max_calls=settings.lesson_generation_max_science_calls,
-                used_calls=0,
-                server_allowlist=json.dumps(["WolframAlpha", "WolframContext"]),
-                schema_hash_snapshot=verified_hash,
-                protocol_version_snapshot="2025-11-25",
-            )
-            db.add(science_auth)
-            db.flush()
-
-    run = AgentRun(course_generation_job_id=job.id, workspace_id=job.workspace_id, role="lesson_writer", attempt_number=job.attempt_count, status="running")
-    db.add(run)
-    db.flush()
+            science_auth = {
+                "id": f"jta-{job.id}-science",
+                "max_calls": settings.lesson_generation_max_science_calls,
+                "server_allowlist": json.dumps(
+                    ["WolframAlpha", "WolframContext"]
+                ),
+                "schema_hash_snapshot": verified_hash,
+                "protocol_version_snapshot": "2025-11-25",
+            }
     started = time.monotonic()
     ordinal = 0
     provider_calls = 0
@@ -396,28 +403,52 @@ def _execute_lesson_generation(db: Session, settings: Settings, job: CourseGener
     science_observations: list[dict[str, Any]] = []
     if science_auth is not None and verification.science_verification_requests:
         from learn_platform_api.services.science_tool_service import execute_science_verification
+        ensure_course_job_tool_authorization(
+            db,
+            authorization_id=science_auth["id"],
+            workspace_id=job.workspace_id,
+            agent_run_id=run.id,
+            course_generation_job_id=job.id,
+            capability_id="science_computation",
+            max_calls=science_auth["max_calls"],
+            server_allowlist=science_auth["server_allowlist"],
+            schema_hash_snapshot=science_auth["schema_hash_snapshot"],
+            protocol_version_snapshot=science_auth[
+                "protocol_version_snapshot"
+            ],
+        )
         for req in verification.science_verification_requests[:3]:
             _lesson_job_active(db, job, settings, started)
-            db.refresh(science_auth)
-            if science_auth.used_calls >= science_auth.max_calls:
-                break
-            science_auth.used_calls += 1
-            db.flush()
-            science_result = execute_science_verification(
-                tool=req.tool,
-                arguments={"query": req.expression},
-                settings=settings,
-                expected_schema_hash=science_auth.schema_hash_snapshot,
-            )
             ordinal += 1
-            _tool_call(
-                db, run, f"ScienceVerification:{req.tool}",
-                ordinal, None, 1 if science_result.success else 0,
-                time.perf_counter(),
-                "succeeded" if science_result.success else "failed",
-                science_result.error_code if not science_result.success else None,
+            tool_recorder = RemoteToolCallRecorder(
+                db,
+                workspace_id=job.workspace_id,
+                agent_run_id=run.id,
+                authorization_kind="job",
+                authorization_id=science_auth["id"],
+                capability_id="science_computation",
+                tool_name=f"ScienceVerification:{req.tool}",
+                ordinal=ordinal,
+                input_hash=hashlib.sha256(req.tool.encode()).hexdigest()[:16],
             )
+            try:
+                tool_recorder.reserve()
+            except ValueError as exc:
+                if str(exc) == TOOL_BUDGET_EXCEEDED:
+                    break
+                raise
+            try:
+                science_result = execute_science_verification(
+                    tool=req.tool,
+                    arguments={"query": req.expression},
+                    settings=settings,
+                    expected_schema_hash=science_auth["schema_hash_snapshot"],
+                )
+            except Exception:
+                tool_recorder.fail(error_code="science_tool_unavailable")
+                raise
             if science_result.success:
+                tool_recorder.succeed(result_count=1)
                 science_observations.append({
                     "block_key": req.block_key,
                     "objective_key": req.objective_key,
@@ -425,6 +456,10 @@ def _execute_lesson_generation(db: Session, settings: Settings, job: CourseGener
                     **science_result.to_safe_dict(),
                 })
             else:
+                tool_recorder.fail(
+                    error_code=science_result.error_code
+                    or "science_tool_unavailable"
+                )
                 raise ValueError("science_verification_failed")
 
     _lesson_job_active(db, job, settings, started)
@@ -470,6 +505,9 @@ def execute_generation(db: Session, settings: Settings, job: CourseGenerationJob
         return
     run = AgentRun(course_generation_job_id=job.id, workspace_id=job.workspace_id, role=role, attempt_number=job.attempt_count, status="running")
     db.add(run); db.flush()
+    # ADR 004 S5.1: commit the minimal owner before any provider request
+    # so the independent recorder session can reference it.
+    db.commit()
     plan, plan_usage = _recorded_call_provider(db, settings, build_search_prompt(role, request), workspace_id=job.workspace_id, agent_run_id=run.id, phase="plan")
     maximum_searches = 5 if role == "course_architect" else 3
     queries = plan.get("queries") if isinstance(plan, dict) else None

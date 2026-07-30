@@ -104,22 +104,18 @@ def maintain_practice_lease(job_id: str, worker_id: str, settings):
 
 
 def _capture_progress(db, job: PracticeJob) -> tuple[int, list[dict]]:
-    """Read the authoritative step_count from the in-progress AgentRun.
+    """Read progress without flushing the caller's business transaction.
 
-    The run's step_count is updated incrementally during execution (before each
-    provider call and each search), so even a mid-flight failure reflects the
-    real number of attempted steps. ToolCall count is a consistency lower bound
-    only (plan is not a ToolCall). The session may be autoflush-disabled, so we
-    flush here to make the updated step_count readable.
+    Before rollback, SQLAlchemy's identity map preserves the in-memory
+    ``step_count``. After rollback, independently committed remote-tool facts
+    provide a durable lower bound. Callers combine both snapshots.
     """
-    try:
-        db.flush()
-    except Exception:
-        return 0, []
-    run = db.scalar(select(AgentRun).where(AgentRun.practice_job_id == job.id, AgentRun.workspace_id == job.workspace_id, AgentRun.status == "running"))
+    with db.no_autoflush:
+        run = db.scalar(select(AgentRun).where(AgentRun.practice_job_id == job.id, AgentRun.workspace_id == job.workspace_id, AgentRun.status == "running"))
     if run is None:
         return 0, []
-    calls = list(db.scalars(select(AgentToolCall).where(AgentToolCall.agent_run_id == run.id).order_by(AgentToolCall.ordinal)))
+    with db.no_autoflush:
+        calls = list(db.scalars(select(AgentToolCall).where(AgentToolCall.agent_run_id == run.id).order_by(AgentToolCall.ordinal)))
     safe_calls = [{
         "workspace_id": call.workspace_id,
         "tool_name": call.tool_name,
@@ -131,12 +127,65 @@ def _capture_progress(db, job: PracticeJob) -> tuple[int, list[dict]]:
         "error_code": call.error_code,
         "created_at": call.created_at,
     } for call in calls]
-    return run.step_count or 0, safe_calls
+    durable_step_count = (max(call.ordinal for call in calls) + 1) if calls else 0
+    return max(run.step_count or 0, durable_step_count), safe_calls
+
+
+def _capture_pending_tool_calls(db, job: PracticeJob) -> list[dict]:
+    """Snapshot unflushed local-only tool facts before business rollback."""
+    run = next((
+        value for value in db.identity_map.values()
+        if isinstance(value, AgentRun)
+        and value.practice_job_id == job.id
+        and value.workspace_id == job.workspace_id
+        and value.status == "running"
+    ), None)
+    if run is None:
+        return []
+    return [{
+        "workspace_id": call.workspace_id,
+        "tool_name": call.tool_name,
+        "ordinal": call.ordinal,
+        "status": call.status,
+        "input_hash": call.input_hash,
+        "result_count": call.result_count,
+        "latency_ms": call.latency_ms,
+        "error_code": call.error_code,
+        "created_at": call.created_at,
+    } for call in db.new if (
+        isinstance(call, AgentToolCall) and call.agent_run_id == run.id
+    )]
 
 
 def _fail_job(db, job: PracticeJob, code: str, *, retryable: bool, settings, step_count: int = 0, tool_calls: list[dict] | None = None) -> None:
     role = "exercise_author" if job.job_type == "generate_set" else "answer_grader"
-    run = AgentRun(practice_job_id=job.id, workspace_id=job.workspace_id, role=role, attempt_number=job.attempt_count, status="failed", step_count=step_count, error_code=code, completed_at=datetime.now(timezone.utc))
+    # ADR 004 commits the minimal running owner before the first outbound
+    # request. Finalize that same attempt after the business transaction rolls
+    # back; creating a second failed row would split ProviderCall facts from the
+    # terminal outcome and falsely look like duplicate execution.
+    run = db.scalar(
+        select(AgentRun)
+        .where(
+            AgentRun.practice_job_id == job.id,
+            AgentRun.workspace_id == job.workspace_id,
+            AgentRun.role == role,
+            AgentRun.attempt_number == job.attempt_count,
+            AgentRun.status == "running",
+        )
+        .order_by(AgentRun.created_at.desc())
+        .limit(1)
+    )
+    if run is None:
+        run = AgentRun(
+            practice_job_id=job.id,
+            workspace_id=job.workspace_id,
+            role=role,
+            attempt_number=job.attempt_count,
+        )
+    run.status = "failed"
+    run.step_count = step_count
+    run.error_code = code
+    run.completed_at = datetime.now(timezone.utc)
     db.add(run)
     db.flush()
     for call in tool_calls or []:
@@ -155,6 +204,7 @@ def _fail_job(db, job: PracticeJob, code: str, *, retryable: bool, settings, ste
     else:
         job.status = "failed"
         job.next_attempt_at = None
+        job.completed_at = datetime.now(timezone.utc)
         if job.job_type == "grade_attempt":
             attempt = db.get(PracticeAttempt, job.practice_attempt_id)
             if attempt is not None and attempt.status not in {"succeeded", "canceled"}:
@@ -163,8 +213,53 @@ def _fail_job(db, job: PracticeJob, code: str, *, retryable: bool, settings, ste
                 attempt.error_message = ERROR_MESSAGES.get(code, "评分失败")
     job.error_code = code
     job.error_message = ERROR_MESSAGES.get(code, "练习任务失败")
+    job.worker_id = None
     job.lease_expires_at = None
     job.heartbeat_at = None
+
+
+def _cancel_job(
+    db,
+    job: PracticeJob,
+    *,
+    step_count: int,
+    tool_calls: list[dict],
+) -> None:
+    role = "exercise_author" if job.job_type == "generate_set" else "answer_grader"
+    run = db.scalar(
+        select(AgentRun)
+        .where(
+            AgentRun.practice_job_id == job.id,
+            AgentRun.workspace_id == job.workspace_id,
+            AgentRun.role == role,
+            AgentRun.attempt_number == job.attempt_count,
+            AgentRun.status == "running",
+        )
+        .order_by(AgentRun.created_at.desc())
+        .limit(1)
+    )
+    completed = datetime.now(timezone.utc)
+    if run is not None:
+        run.status = "canceled"
+        run.step_count = step_count
+        run.error_code = "practice_canceled"
+        run.completed_at = completed
+        for call in tool_calls:
+            db.add(AgentToolCall(agent_run_id=run.id, **call))
+
+    job.status = "canceled"
+    job.error_code = "practice_canceled"
+    job.error_message = ERROR_MESSAGES["practice_canceled"]
+    job.worker_id = None
+    job.lease_expires_at = None
+    job.heartbeat_at = None
+    job.next_attempt_at = None
+    job.completed_at = completed
+    if job.job_type == "grade_attempt":
+        attempt = db.get(PracticeAttempt, job.practice_attempt_id)
+        if attempt is not None and attempt.status != "succeeded":
+            attempt.status = "canceled"
+            attempt.completed_at = completed
 
 
 def run_practice_job(job_id: str) -> None:
@@ -197,25 +292,28 @@ def run_practice_job(job_id: str) -> None:
                     raise ValueError("practice_canceled")
             db.commit()
         except ValueError as exc:
-            progress, tool_calls = _capture_progress(db, job)
+            local_progress, _ = _capture_progress(db, job)
+            pending_tool_calls = _capture_pending_tool_calls(db, job)
             db.rollback()
             job = db.get(PracticeJob, job_id)
             if not job or job.worker_id != worker_id:
                 return
+            durable_progress, durable_tool_calls = _capture_progress(db, job)
+            progress = max(local_progress, durable_progress)
+            durable_ordinals = {
+                call["ordinal"] for call in durable_tool_calls
+            }
+            tool_calls = [
+                call for call in pending_tool_calls
+                if call["ordinal"] not in durable_ordinals
+            ]
             if job.status == "cancel_requested":
-                job.status = "canceled"
-                job.error_code = "practice_canceled"
-                job.error_message = ERROR_MESSAGES["practice_canceled"]
-                job.worker_id = None
-                job.lease_expires_at = None
-                job.heartbeat_at = None
-                job.next_attempt_at = None
-                job.completed_at = datetime.now(timezone.utc)
-                if job.job_type == "grade_attempt":
-                    attempt = db.get(PracticeAttempt, job.practice_attempt_id)
-                    if attempt is not None and attempt.status not in {"succeeded"}:
-                        attempt.status = "canceled"
-                        attempt.completed_at = datetime.now(timezone.utc)
+                _cancel_job(
+                    db,
+                    job,
+                    step_count=progress,
+                    tool_calls=tool_calls,
+                )
                 db.commit()
                 return
             if job.status != "running":
@@ -226,9 +324,11 @@ def run_practice_job(job_id: str) -> None:
         except Exception:
             logger.exception("practice_internal_error job_id=%s", job_id)
             try:
-                progress, tool_calls = _capture_progress(db, job)
+                local_progress, _ = _capture_progress(db, job)
+                pending_tool_calls = _capture_pending_tool_calls(db, job)
             except Exception:
-                progress, tool_calls = 0, []
+                local_progress = 0
+                pending_tool_calls = []
             # SQLAlchemy may already have placed the transaction in a failed
             # state (for example after a database constraint violation). Roll
             # back before any ORM read so error handling cannot raise a second
@@ -237,20 +337,25 @@ def run_practice_job(job_id: str) -> None:
             job = db.get(PracticeJob, job_id)
             if not job or job.worker_id != worker_id:
                 return
+            try:
+                durable_progress, durable_tool_calls = _capture_progress(db, job)
+            except Exception:
+                durable_progress, durable_tool_calls = 0, []
+            progress = max(local_progress, durable_progress)
+            durable_ordinals = {
+                call["ordinal"] for call in durable_tool_calls
+            }
+            tool_calls = [
+                call for call in pending_tool_calls
+                if call["ordinal"] not in durable_ordinals
+            ]
             if job.status == "cancel_requested":
-                job.status = "canceled"
-                job.error_code = "practice_canceled"
-                job.error_message = ERROR_MESSAGES["practice_canceled"]
-                job.worker_id = None
-                job.lease_expires_at = None
-                job.heartbeat_at = None
-                job.next_attempt_at = None
-                job.completed_at = datetime.now(timezone.utc)
-                if job.job_type == "grade_attempt":
-                    attempt = db.get(PracticeAttempt, job.practice_attempt_id)
-                    if attempt is not None and attempt.status != "succeeded":
-                        attempt.status = "canceled"
-                        attempt.completed_at = datetime.now(timezone.utc)
+                _cancel_job(
+                    db,
+                    job,
+                    step_count=progress,
+                    tool_calls=tool_calls,
+                )
                 db.commit()
                 return
             if job.status != "running":

@@ -78,7 +78,17 @@ def patched(*targets):
 def fresh_db():
     engine = create_engine("sqlite+pysqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     Base.metadata.create_all(engine)
-    return sessionmaker(bind=engine, expire_on_commit=False)()
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    db = factory()
+    # Expose the session factory so the ADR 004 independent ProviderCall
+    # recorder commits through this same in-memory SQLite engine (StaticPool
+    # pins it to one shared connection) instead of falling back to the
+    # production Postgres SessionLocal, which would cross databases and fail
+    # the agent_runs / workspace foreign key. SQLite is a legacy eval backend
+    # only; the durable Postgres contract is proven by the throwaway-Postgres
+    # acceptance tests.
+    db._test_session_factory = factory
+    return db
 
 
 def _add(db, obj):

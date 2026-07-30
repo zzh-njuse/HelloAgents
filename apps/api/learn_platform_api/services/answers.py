@@ -226,6 +226,9 @@ def answer_question(
     )
     db.add(trace)
     db.flush()
+    # ADR 004 S5.1: commit the minimal owner before any provider request
+    # so the independent recorder session can reference it.
+    db.commit()
     # _generate returns (result, usage, latency_ms) but record_provider_call
     # expects call_fn to return (result, usage). Wrap to strip latency and
     # track it externally.
@@ -271,7 +274,8 @@ def answer_question(
         # answers expose only cited claims; insufficiency is decided server-side.
         limitations: list[str] = []
         answer_text = "\n".join(claim.text for claim in claims)
-        # Update the trace with final results
+        # Update the trace with final results and commit (Fix 1: Spec 003 S3.2 /
+        # ADR 004 S3.3 — the trace must not remain running after the request ends).
         trace.status = "succeeded"
         trace.input_tokens = usage.get("input_tokens")
         trace.output_tokens = usage.get("output_tokens")
@@ -279,7 +283,7 @@ def answer_question(
         trace.generation_latency_ms = generation_latency
         trace.answer_hash = hashlib.sha256(answer_text.encode("utf-8")).hexdigest()
         trace.completed_at = _now()
-        db.flush()
+        db.commit()
         return {"trace_id": trace.id, "status": "succeeded", "claims": claims, "citations": citations, "limitations": limitations, "model": settings.product_generation_model, "usage": usage}
     except Exception as exc:
         from learn_platform_api.services.provider_call_recorder import classify_error
@@ -288,5 +292,10 @@ def answer_question(
         trace.error_code = stable_code
         trace.error_message = "回答服务暂不可用" if stable_code != "invalid_model_output" else "回答模型返回格式无效"
         trace.completed_at = _now()
-        db.flush()
+        # Fix 1: commit the failed trace state. If the commit itself fails,
+        # log but never swallow the original business exception.
+        try:
+            db.commit()
+        except Exception:
+            logger.exception("answer_trace_finalize_commit_failed trace_id=%s", trace.id)
         raise

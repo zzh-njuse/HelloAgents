@@ -12,7 +12,8 @@ Covers (Spec 003 / ADR 002):
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import hashlib
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from uuid import uuid4
 
@@ -50,6 +51,13 @@ from learn_platform_api.services.provider_call_recorder import (
 )
 
 
+# --- ADR 004 helper: get the test session factory from the fixture ---------------
+
+def _sf(db_session):
+    """Return the test session factory for independent recorder sessions."""
+    return getattr(db_session, '_test_session_factory', None)
+
+
 # --- seed helpers ---------------------------------------------------------------
 
 def _ws(db_session) -> Workspace:
@@ -73,6 +81,9 @@ def _run(db_session, ws: Workspace) -> AgentRun:
     )
     db_session.add(ar)
     db_session.flush()
+    # ADR 004 S5.1: the owner must be committed so the independent recorder
+    # session can reference it as a FK target.
+    db_session.commit()
     return ar
 
 
@@ -83,6 +94,9 @@ def _trace(db_session, ws: Workspace) -> RagAnswerTrace:
     )
     db_session.add(t)
     db_session.flush()
+    # ADR 004 S5.1: the owner must be committed so the independent recorder
+    # session can reference it as a FK target.
+    db_session.commit()
     return t
 
 
@@ -103,6 +117,8 @@ def _snapshot(
     )
     db_session.add(snap)
     db_session.flush()
+    # ADR 004: commit so the independent recorder session can see the snapshot.
+    db_session.commit()
     return snap
 
 
@@ -130,8 +146,9 @@ def test_recorder_start_creates_started_call(db_session) -> None:
     ws = _ws(db_session)
     run = _run(db_session, ws)
     recorder = ProviderCallRecorder(
-        db_session, workspace_id=ws.id, agent_run_id=run.id,
+        workspace_id=ws.id, agent_run_id=run.id,
         provider="deepseek", model="deepseek-v4-flash", phase="generation",
+        _session_factory=_sf(db_session),
     )
     recorder.start()
     assert recorder.call_id is not None
@@ -151,8 +168,9 @@ def test_recorder_succeed_records_usage(db_session) -> None:
     ws = _ws(db_session)
     run = _run(db_session, ws)
     recorder = ProviderCallRecorder(
-        db_session, workspace_id=ws.id, agent_run_id=run.id,
+        workspace_id=ws.id, agent_run_id=run.id,
         provider="deepseek", model="deepseek-v4-flash", phase="generation",
+        _session_factory=_sf(db_session),
     )
     recorder.start()
     recorder.succeed(input_tokens=100, output_tokens=50)
@@ -168,8 +186,9 @@ def test_recorder_fail_records_error_code(db_session) -> None:
     ws = _ws(db_session)
     run = _run(db_session, ws)
     recorder = ProviderCallRecorder(
-        db_session, workspace_id=ws.id, agent_run_id=run.id,
+        workspace_id=ws.id, agent_run_id=run.id,
         provider="deepseek", model="deepseek-v4-flash", phase="generation",
+        _session_factory=_sf(db_session),
     )
     recorder.start()
     recorder.fail(error_code="provider_unavailable")
@@ -183,8 +202,9 @@ def test_recorder_timeout(db_session) -> None:
     ws = _ws(db_session)
     run = _run(db_session, ws)
     recorder = ProviderCallRecorder(
-        db_session, workspace_id=ws.id, agent_run_id=run.id,
+        workspace_id=ws.id, agent_run_id=run.id,
         provider="deepseek", model="deepseek-v4-flash", phase="generation",
+        _session_factory=_sf(db_session),
     )
     recorder.start()
     recorder.timeout()
@@ -198,8 +218,9 @@ def test_recorder_cancel(db_session) -> None:
     ws = _ws(db_session)
     run = _run(db_session, ws)
     recorder = ProviderCallRecorder(
-        db_session, workspace_id=ws.id, agent_run_id=run.id,
+        workspace_id=ws.id, agent_run_id=run.id,
         provider="deepseek", model="deepseek-v4-flash", phase="generation",
+        _session_factory=_sf(db_session),
     )
     recorder.start()
     recorder.cancel(error_code="generation_canceled")
@@ -215,8 +236,9 @@ def test_recorder_succeed_null_usage_stays_null(db_session) -> None:
     ws = _ws(db_session)
     run = _run(db_session, ws)
     recorder = ProviderCallRecorder(
-        db_session, workspace_id=ws.id, agent_run_id=run.id,
+        workspace_id=ws.id, agent_run_id=run.id,
         provider="deepseek", model="deepseek-v4-flash", phase="answer",
+        _session_factory=_sf(db_session),
     )
     recorder.start()
     recorder.succeed()  # no usage provided
@@ -229,8 +251,9 @@ def test_recorder_succeed_single_dim_usage(db_session) -> None:
     ws = _ws(db_session)
     run = _run(db_session, ws)
     recorder = ProviderCallRecorder(
-        db_session, workspace_id=ws.id, agent_run_id=run.id,
+        workspace_id=ws.id, agent_run_id=run.id,
         provider="deepseek", model="deepseek-v4-flash", phase="answer",
+        _session_factory=_sf(db_session),
     )
     recorder.start()
     recorder.succeed(input_tokens=100)  # output_tokens omitted
@@ -246,8 +269,9 @@ def test_ordinal_monotonic_within_run(db_session) -> None:
     run = _run(db_session, ws)
     for i, phase in enumerate(["plan", "generation", "repair"]):
         recorder = ProviderCallRecorder(
-            db_session, workspace_id=ws.id, agent_run_id=run.id,
+            workspace_id=ws.id, agent_run_id=run.id,
             provider="deepseek", model="deepseek-v4-flash", phase=phase,
+            _session_factory=_sf(db_session),
         )
         recorder.start()
         recorder.succeed(input_tokens=10, output_tokens=5)
@@ -260,8 +284,9 @@ def test_ordinal_monotonic_within_rag_trace(db_session) -> None:
     trace = _trace(db_session, ws)
     for i, phase in enumerate(["answer", "repair"]):
         recorder = ProviderCallRecorder(
-            db_session, workspace_id=ws.id, rag_answer_trace_id=trace.id,
+            workspace_id=ws.id, rag_answer_trace_id=trace.id,
             provider="deepseek", model="deepseek-v4-flash", phase=phase,
+            _session_factory=_sf(db_session),
         )
         recorder.start()
         recorder.succeed(input_tokens=10, output_tokens=5)
@@ -278,8 +303,9 @@ def test_price_snapshot_selected_when_available(db_session) -> None:
                      input_rate="40", output_rate="120",
                      effective_at=datetime(2026, 1, 1, tzinfo=timezone.utc))
     recorder = ProviderCallRecorder(
-        db_session, workspace_id=ws.id, agent_run_id=run.id,
+        workspace_id=ws.id, agent_run_id=run.id,
         provider="deepseek", model="deepseek-v4-flash", phase="generation",
+        _session_factory=_sf(db_session),
     )
     recorder.start()
     pc = db_session.get(ProviderCall, recorder.call_id)
@@ -291,8 +317,9 @@ def test_price_snapshot_null_when_no_match(db_session) -> None:
     run = _run(db_session, ws)
     # No snapshot for this provider/model
     recorder = ProviderCallRecorder(
-        db_session, workspace_id=ws.id, agent_run_id=run.id,
+        workspace_id=ws.id, agent_run_id=run.id,
         provider="openai", model="gpt-4o", phase="generation",
+        _session_factory=_sf(db_session),
     )
     recorder.start()
     pc = db_session.get(ProviderCall, recorder.call_id)
@@ -302,13 +329,16 @@ def test_price_snapshot_null_when_no_match(db_session) -> None:
 def test_price_snapshot_excludes_future(db_session) -> None:
     ws = _ws(db_session)
     run = _run(db_session, ws)
-    # Future snapshot (effective_at in year 2027)
+    # Future snapshot: effective_at is firmly in the future (now + 365 days),
+    # so it must NOT be bound to the current Provider Call regardless of the
+    # calendar date the test runs on.
     _snapshot(db_session, provider="deepseek", model="deepseek-v4-flash",
               input_rate="100", output_rate="300",
-              effective_at=datetime(2027, 1, 1, tzinfo=timezone.utc))
+              effective_at=datetime.now(timezone.utc) + timedelta(days=365))
     recorder = ProviderCallRecorder(
-        db_session, workspace_id=ws.id, agent_run_id=run.id,
+        workspace_id=ws.id, agent_run_id=run.id,
         provider="deepseek", model="deepseek-v4-flash", phase="generation",
+        _session_factory=_sf(db_session),
     )
     recorder.start()
     pc = db_session.get(ProviderCall, recorder.call_id)
@@ -325,8 +355,9 @@ def test_price_snapshot_picks_most_recent(db_session) -> None:
                    input_rate="50", output_rate="150",
                    effective_at=datetime(2026, 6, 1, tzinfo=timezone.utc))
     recorder = ProviderCallRecorder(
-        db_session, workspace_id=ws.id, agent_run_id=run.id,
+        workspace_id=ws.id, agent_run_id=run.id,
         provider="deepseek", model="deepseek-v4-flash", phase="generation",
+        _session_factory=_sf(db_session),
     )
     recorder.start()
     pc = db_session.get(ProviderCall, recorder.call_id)
@@ -341,9 +372,10 @@ def test_double_owner_rejected(db_session) -> None:
     trace = _trace(db_session, ws)
     with pytest.raises(ValueError, match="provider_call_double_owner"):
         ProviderCallRecorder(
-            db_session, workspace_id=ws.id,
+            workspace_id=ws.id,
             agent_run_id=run.id, rag_answer_trace_id=trace.id,
             provider="deepseek", model="deepseek-v4-flash", phase="generation",
+            _session_factory=_sf(db_session),
         )
 
 
@@ -351,8 +383,9 @@ def test_rag_owner_call_created(db_session) -> None:
     ws = _ws(db_session)
     trace = _trace(db_session, ws)
     recorder = ProviderCallRecorder(
-        db_session, workspace_id=ws.id, rag_answer_trace_id=trace.id,
+        workspace_id=ws.id, rag_answer_trace_id=trace.id,
         provider="deepseek", model="deepseek-v4-flash", phase="answer",
+        _session_factory=_sf(db_session),
     )
     recorder.start()
     recorder.succeed(input_tokens=200, output_tokens=100)
@@ -391,9 +424,10 @@ def test_unknown_phase_rejected(db_session) -> None:
     ws = _ws(db_session)
     with pytest.raises(ValueError, match="unknown_provider_call_phase"):
         ProviderCallRecorder(
-            db_session, workspace_id=ws.id,
+            workspace_id=ws.id,
             provider="deepseek", model="deepseek-v4-flash",
             phase="dynamic_phase_123",
+            _session_factory=_sf(db_session),
         )
 
 
@@ -466,11 +500,10 @@ def test_record_provider_call_cancel(db_session) -> None:
 
 # --- Constraint failure prevents provider call ----------------------------------
 
-def test_flush_failure_prevents_provider_call(db_session) -> None:
-    """If the ProviderCall flush fails (e.g. constraint violation), the
-    provider stub must NOT be called."""
+def test_invalid_phase_rejected_before_provider_call(db_session) -> None:
+    """Fix 4 (renamed): Invalid phase is rejected at recorder construction,
+    before any session is opened. The provider stub is never called."""
     ws = _ws(db_session)
-    # Create a call with an invalid phase that will fail the CHECK constraint
     call_count = 0
 
     def fake_call():
@@ -993,3 +1026,358 @@ def test_non_timeout_failure_not_misclassified(db_session) -> None:
     assert len(calls) == 1
     assert calls[0].status == STATUS_FAILED
     assert calls[0].error_code == PROVIDER_UNAVAILABLE
+
+
+# ============================================================================ #
+# ADR 004: Independent recorder session — rollback persistence & isolation      #
+# ============================================================================ #
+
+def test_provider_call_survives_business_rollback(db_session) -> None:
+    """ADR 004 S3.1: Provider Call fact survives business transaction rollback.
+
+    When the business session rolls back after a provider call, the
+    ProviderCall row must still be present in the database because it
+    was committed in an independent transaction.
+    """
+    ws = _ws(db_session)
+    run = _run(db_session, ws)
+
+    # Simulate: recorder commits a ProviderCall, then business rolls back.
+    recorder = ProviderCallRecorder(
+        workspace_id=ws.id, agent_run_id=run.id,
+        provider="deepseek", model="deepseek-v4-flash", phase="generation",
+        _session_factory=_sf(db_session),
+    )
+    recorder.start()
+    recorder.succeed(input_tokens=100, output_tokens=50)
+    call_id = recorder.call_id
+    assert call_id is not None
+
+    # Business session rolls back (simulating worker error handling).
+    db_session.rollback()
+
+    # The ProviderCall must still exist (committed in independent tx).
+    # Use a fresh session to verify, since the test session was rolled back.
+    sf = _sf(db_session)
+    with sf() as verify_db:
+        pc = verify_db.get(ProviderCall, call_id)
+        assert pc is not None
+        assert pc.status == STATUS_SUCCEEDED
+        assert pc.input_tokens == 100
+        assert pc.output_tokens == 50
+
+
+def test_timeout_provider_call_survives_business_rollback(db_session) -> None:
+    """ADR 004: timeout ProviderCall survives business rollback.
+
+    This is the core scenario from the system test: Tutor timeout causes
+    recorder to form timed_out/provider_timeout, then worker rollback
+    must not delete it.
+    """
+    import httpx
+    ws = _ws(db_session)
+    run = _run(db_session, ws)
+
+    recorder = ProviderCallRecorder(
+        workspace_id=ws.id, agent_run_id=run.id,
+        provider="deepseek", model="deepseek-v4-flash", phase="answer",
+        _session_factory=_sf(db_session),
+    )
+    recorder.start()
+    recorder.timeout()
+    call_id = recorder.call_id
+
+    # Business rollback (as in tutor_workers.run_tutor_turn).
+    db_session.rollback()
+
+    # Verify the timed_out fact persists.
+    sf = _sf(db_session)
+    with sf() as verify_db:
+        pc = verify_db.get(ProviderCall, call_id)
+        assert pc is not None
+        assert pc.status == STATUS_TIMED_OUT
+        assert pc.error_code == PROVIDER_TIMEOUT
+
+
+def test_failed_provider_call_survives_business_rollback(db_session) -> None:
+    """ADR 004: failed ProviderCall survives business rollback."""
+    ws = _ws(db_session)
+    run = _run(db_session, ws)
+
+    recorder = ProviderCallRecorder(
+        workspace_id=ws.id, agent_run_id=run.id,
+        provider="deepseek", model="deepseek-v4-flash", phase="generation",
+        _session_factory=_sf(db_session),
+    )
+    recorder.start()
+    recorder.fail(error_code="provider_unavailable")
+    call_id = recorder.call_id
+
+    db_session.rollback()
+
+    sf = _sf(db_session)
+    with sf() as verify_db:
+        pc = verify_db.get(ProviderCall, call_id)
+        assert pc is not None
+        assert pc.status == STATUS_FAILED
+        assert pc.error_code == "provider_unavailable"
+
+
+def test_recorder_does_not_modify_caller_session(db_session) -> None:
+    """ADR 004 S5.4: The independent recorder1 recorder Session never touches,
+    closes, rolls back or commits the caller's business Session.
+
+    After recording, the caller's session should have no pending ProviderCall
+    writes (they were committed in the independent session).
+    """
+    ws = _ws(db_session)
+    run = _run(db_session, ws)
+
+    # The caller's session has no ProviderCall objects in its identity map.
+    before_count = len(list(db_session.scalars(
+        select(ProviderCall).where(ProviderCall.agent_run_id == run.id)
+    )))
+    assert before_count == 0
+
+    recorder = ProviderCallRecorder(
+        workspace_id=ws.id, agent_run_id=run.id,
+        provider="deepseek", model="deepseek-v4-flash", phase="generation",
+        _session_factory=_sf(db_session),
+    )
+    recorder.start()
+    recorder.succeed(input_tokens=50, output_tokens=25)
+
+    # The caller's session still has no ProviderCall objects (they were
+    # committed in the independent session, not added to this session).
+    # We need to commit/refresh to see them since they're in a different session.
+    db_session.commit()
+    after_count = len(list(db_session.scalars(
+        select(ProviderCall).where(ProviderCall.agent_run_id == run.id)
+    )))
+    assert after_count == 1
+
+
+def test_start_invalid_phase_prevents_provider_call(db_session) -> None:
+    """Fix 4 (renamed): Invalid phase is rejected at recorder construction,
+    before any session is opened. The provider stub is never called.
+
+    This is a validation-level failure, NOT a real DB commit/FK failure.
+    See test_start_fk_failure_nonexistent_agent_run_prevents_provider_call
+    for the real DB constraint failure test.
+    """
+    ws = _ws(db_session)
+    call_count = 0
+
+    def fake_call():
+        nonlocal call_count
+        call_count += 1
+        return ({}, {})
+
+    # Using an invalid phase triggers ValueError from the recorder itself
+    # before any session is opened.
+    with pytest.raises(ValueError, match="unknown_provider_call_phase"):
+        record_provider_call(
+            db_session, workspace_id=ws.id,
+            provider="deepseek", model="deepseek-v4-flash",
+            phase="invalid_phase", call_fn=fake_call,
+        )
+    assert call_count == 0  # provider stub never called
+
+
+def test_succeeded_call_remains_succeeded_after_artifact_validation_failure(db_session) -> None:
+    """ADR 004 S3.3: provider returns success but artifact validation fails ->
+    the ProviderCall still has status=succeeded.
+
+    The provider call fact is independent of business artifact validation.
+    """
+    ws = _ws(db_session)
+    run = _run(db_session, ws)
+
+    recorder = ProviderCallRecorder(
+        workspace_id=ws.id, agent_run_id=run.id,
+        provider="deepseek", model="deepseek-v4-flash", phase="answer",
+        _session_factory=_sf(db_session),
+    )
+    recorder.start()
+    recorder.succeed(input_tokens=200, output_tokens=100)
+    call_id = recorder.call_id
+
+    # Business artifact validation fails -> rollback.
+    db_session.rollback()
+
+    # ProviderCall is still succeeded.
+    sf = _sf(db_session)
+    with sf() as verify_db:
+        pc = verify_db.get(ProviderCall, call_id)
+        assert pc is not None
+        assert pc.status == STATUS_SUCCEEDED
+
+
+def test_rag_owner_provider_call_survives_business_rollback(db_session) -> None:
+    """ADR 004: RAG Answer ProviderCall survives business rollback."""
+    ws = _ws(db_session)
+    trace = _trace(db_session, ws)
+
+    recorder = ProviderCallRecorder(
+        workspace_id=ws.id, rag_answer_trace_id=trace.id,
+        provider="deepseek", model="deepseek-v4-flash", phase="answer",
+        _session_factory=_sf(db_session),
+    )
+    recorder.start()
+    recorder.succeed(input_tokens=300, output_tokens=150)
+    call_id = recorder.call_id
+
+    db_session.rollback()
+
+    sf = _sf(db_session)
+    with sf() as verify_db:
+        pc = verify_db.get(ProviderCall, call_id)
+        assert pc is not None
+        assert pc.status == STATUS_SUCCEEDED
+        assert pc.rag_answer_trace_id == trace.id
+
+
+# ============================================================================ #
+# Fix 1: RAG Answer Trace final state — replaced by acceptance tests           #
+# ============================================================================ #
+# The old test_rag_trace_succeeded_is_committed and
+# test_rag_trace_failed_is_committed manually created a Trace, assigned
+# status, and committed — never calling answer_question(). They have been
+# replaced by test_acceptance_evidence_rag_trace.py which calls the real
+# answer_question() service.
+
+
+# ============================================================================ #
+# Fix 2: Recorder finalizer unit tests (direct finalizer calls)                #
+# ============================================================================ #
+# These are UNIT tests for the ProviderCallRecorder finalizer methods,
+# verifying that each finalizer raises RuntimeError when the record is
+# missing. They test the recorder's finalizer behavior directly, NOT
+# through the record_provider_call() wrapper.
+#
+# The WRAPPER-level acceptance tests (which prove the wrapper does not
+# return success on finalize-missing, and preserves original exceptions)
+# are in test_acceptance_evidence_wrapper.py.
+
+def test_recorder_succeed_unit_raises_on_missing_record(db_session) -> None:
+    """Unit: succeed() raises RuntimeError('provider_call_finalize_missing')
+    when the ProviderCall record is gone from the independent session."""
+    ws = _ws(db_session)
+    run = _run(db_session, ws)
+    recorder = ProviderCallRecorder(
+        workspace_id=ws.id, agent_run_id=run.id,
+        provider="deepseek", model="deepseek-v4-flash", phase="generation",
+        _session_factory=_sf(db_session),
+    )
+    recorder.start()
+    call_id = recorder.call_id
+    assert call_id is not None
+
+    sf = _sf(db_session)
+    with sf() as del_db:
+        pc = del_db.get(ProviderCall, call_id)
+        if pc is not None:
+            del_db.delete(pc)
+            del_db.commit()
+
+    with pytest.raises(RuntimeError, match="provider_call_finalize_missing"):
+        recorder.succeed(input_tokens=10, output_tokens=5)
+
+
+def test_recorder_fail_unit_raises_on_missing_record(db_session) -> None:
+    """Unit: fail() raises RuntimeError('provider_call_finalize_missing')."""
+    ws = _ws(db_session)
+    run = _run(db_session, ws)
+    recorder = ProviderCallRecorder(
+        workspace_id=ws.id, agent_run_id=run.id,
+        provider="deepseek", model="deepseek-v4-flash", phase="generation",
+        _session_factory=_sf(db_session),
+    )
+    recorder.start()
+    call_id = recorder.call_id
+
+    sf = _sf(db_session)
+    with sf() as del_db:
+        pc = del_db.get(ProviderCall, call_id)
+        if pc is not None:
+            del_db.delete(pc)
+            del_db.commit()
+
+    with pytest.raises(RuntimeError, match="provider_call_finalize_missing"):
+        recorder.fail(error_code="provider_unavailable")
+
+
+def test_recorder_timeout_unit_raises_on_missing_record(db_session) -> None:
+    """Unit: timeout() raises RuntimeError('provider_call_finalize_missing')."""
+    ws = _ws(db_session)
+    run = _run(db_session, ws)
+    recorder = ProviderCallRecorder(
+        workspace_id=ws.id, agent_run_id=run.id,
+        provider="deepseek", model="deepseek-v4-flash", phase="generation",
+        _session_factory=_sf(db_session),
+    )
+    recorder.start()
+    call_id = recorder.call_id
+
+    sf = _sf(db_session)
+    with sf() as del_db:
+        pc = del_db.get(ProviderCall, call_id)
+        if pc is not None:
+            del_db.delete(pc)
+            del_db.commit()
+
+    with pytest.raises(RuntimeError, match="provider_call_finalize_missing"):
+        recorder.timeout()
+
+
+def test_recorder_cancel_unit_raises_on_missing_record(db_session) -> None:
+    """Unit: cancel() raises RuntimeError('provider_call_finalize_missing')."""
+    ws = _ws(db_session)
+    run = _run(db_session, ws)
+    recorder = ProviderCallRecorder(
+        workspace_id=ws.id, agent_run_id=run.id,
+        provider="deepseek", model="deepseek-v4-flash", phase="generation",
+        _session_factory=_sf(db_session),
+    )
+    recorder.start()
+    call_id = recorder.call_id
+
+    sf = _sf(db_session)
+    with sf() as del_db:
+        pc = del_db.get(ProviderCall, call_id)
+        if pc is not None:
+            del_db.delete(pc)
+            del_db.commit()
+
+    with pytest.raises(RuntimeError, match="provider_call_finalize_missing"):
+        recorder.cancel(error_code="generation_canceled")
+
+
+# ============================================================================ #
+# Fix 4: Input validation (invalid phase) — renamed for accuracy               #
+# ============================================================================ #
+# The old test_invalid_phase_prevents_provider_call_renamed only verified
+# that an invalid phase is rejected at recorder construction time. This is
+# a validation-level failure, NOT a real DB commit/FK failure.
+#
+# The real FK failure tests (which use record_provider_call with fake_call)
+# are in test_acceptance_evidence_wrapper.py.
+
+def test_invalid_phase_rejected_is_input_validation(db_session) -> None:
+    """Input validation: Invalid phase is rejected at recorder construction,
+    before any session is opened. This is NOT a DB constraint failure."""
+    ws = _ws(db_session)
+    call_count = 0
+
+    def fake_call():
+        nonlocal call_count
+        call_count += 1
+        return ({}, {})
+
+    with pytest.raises(ValueError, match="unknown_provider_call_phase"):
+        record_provider_call(
+            db_session, workspace_id=ws.id,
+            provider="deepseek", model="deepseek-v4-flash",
+            phase="invalid_phase", call_fn=fake_call,
+        )
+    assert call_count == 0

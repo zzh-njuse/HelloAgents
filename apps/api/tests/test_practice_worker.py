@@ -76,7 +76,7 @@ def test_worker_claims_and_completes_generation(db_session: Session, monkeypatch
     monkeypatch.setattr(practice, "enqueue_practice_job", lambda *_a: None)
     monkeypatch.setattr(practice_generation, "retrieve", lambda *_a, **_k: ("t", [RetrievalResult(score=0.9, text=chunk.content, citation=CitationRead(document_id=doc.id, document_version_id=ver.id, chunk_id=chunk.id, document_name=doc.display_name, heading_path=[], start_offset=0, end_offset=len(chunk.content)))]))
     provider = iter([({"queries": ["q"]}, {"input_tokens": 2, "output_tokens": 2}), (_artifact(), {"input_tokens": 10, "output_tokens": 20})])
-    monkeypatch.setattr(practice_generation, "call_provider", lambda *_a, **_k: next(provider))
+    monkeypatch.setattr(practice_generation, "call_practice_provider", lambda *_a, **_k: next(provider))
     monkeypatch.setattr(practice_workers, "SessionLocal", lambda: _SharedSession(db_session))
 
     job = practice.create_generation_job(db_session, get_settings(), ws.id, course.id, cv.id, lesson.id, lv.id, _gen_payload(2, "zh-CN"), "g1")
@@ -94,7 +94,7 @@ def test_worker_cancel_requested_marks_canceled_and_commits_nothing(db_session: 
     ws, course, cv, lesson, lv, chunk, doc, ver = _reader(db_session)
     monkeypatch.setattr(practice, "enqueue_practice_job", lambda *_a: None)
     monkeypatch.setattr(practice_generation, "retrieve", lambda *_a, **_k: ("t", []))
-    monkeypatch.setattr(practice_generation, "call_provider", lambda *_a, **_k: ({"queries": ["q"]}, {"input_tokens": 1, "output_tokens": 1}))
+    monkeypatch.setattr(practice_generation, "call_practice_provider", lambda *_a, **_k: ({"queries": ["q"]}, {"input_tokens": 1, "output_tokens": 1}))
     monkeypatch.setattr(practice_workers, "SessionLocal", lambda: _SharedSession(db_session))
 
     job = practice.create_generation_job(db_session, get_settings(), ws.id, course.id, cv.id, lesson.id, lv.id, _gen_payload(1, "zh-CN"), "g2")
@@ -120,7 +120,7 @@ def test_worker_duplicate_delivery_is_a_noop(db_session: Session, monkeypatch) -
     # always returning plan and never reaching the artifact).
     call_log = []
     _provider = iter([({"queries": ["q"]}, {"input_tokens": 1, "output_tokens": 1}), (_artifact(), {"input_tokens": 1, "output_tokens": 1})])
-    monkeypatch.setattr(practice_generation, "call_provider", lambda *_a, **_k: (call_log.append(1), next(_provider))[1])
+    monkeypatch.setattr(practice_generation, "call_practice_provider", lambda *_a, **_k: (call_log.append(1), next(_provider))[1])
     monkeypatch.setattr(practice_workers, "SessionLocal", lambda: _SharedSession(db_session))
     practice_workers.run_practice_job(job.id); db_session.commit()
     assert db_session.get(PracticeJob, job.id).status == "succeeded"
@@ -143,12 +143,14 @@ def test_worker_failure_keeps_real_step_count(db_session: Session, monkeypatch) 
     # and repair is denied because provider call budget is still available but repair also invalid.
     bad = {"items": [{"target_key": "objective_1", "item_key": "q1", "item_type": "single_choice", "stem": "s", "citation_ids": ["eX"], "options": [{"option_key": "a", "text": "A", "is_correct": True, "rationale": "r", "citation_ids": ["eX"]}, {"option_key": "b", "text": "B", "is_correct": False, "rationale": "r", "citation_ids": ["eX"]}]}]}
     provider = iter([({"queries": ["q"]}, {"input_tokens": 1, "output_tokens": 1}), (bad, {"input_tokens": 1, "output_tokens": 1}), (bad, {"input_tokens": 1, "output_tokens": 1})])
-    monkeypatch.setattr(practice_generation, "call_provider", lambda *_a, **_k: next(provider))
+    monkeypatch.setattr(practice_generation, "call_practice_provider", lambda *_a, **_k: next(provider))
     monkeypatch.setattr(practice_workers, "SessionLocal", lambda: _SharedSession(db_session))
 
     job = practice.create_generation_job(db_session, get_settings(), ws.id, course.id, cv.id, lesson.id, lv.id, _gen_payload(1, "zh-CN"), "g4")
     practice_workers.run_practice_job(job.id); db_session.commit()
     failed_runs = list(db_session.query(AgentRun).filter_by(practice_job_id=job.id, status="failed"))
+    all_runs = list(db_session.query(AgentRun).filter_by(practice_job_id=job.id))
+    assert len(all_runs) == 1, "one delivery attempt must have exactly one AgentRun"
     assert failed_runs and failed_runs[0].step_count == 4, f"failed AgentRun must keep real step count (plan+search+submit+repair=4), got {failed_runs[0].step_count}"
     from learn_platform_api.db.models import AgentToolCall
     assert db_session.query(AgentToolCall).filter_by(agent_run_id=failed_runs[0].id).count() == 3
@@ -206,3 +208,33 @@ def test_queue_functions_target_isolated_queues() -> None:
     assert settings.practice_queue_name != settings.tutor_queue_name
     assert queue.enqueue_practice_job.__name__ == "enqueue_practice_job"
     assert queue.enqueue_tutor_turn.__name__ == "enqueue_tutor_turn"
+
+
+def test_practice_queue_timeout_exceeds_product_wall_budget(monkeypatch) -> None:
+    from learn_platform_api.services import queue
+
+    captured = {}
+
+    class _Connection:
+        def close(self):
+            captured["closed"] = True
+
+    class _Queue:
+        def __init__(self, name, connection):
+            captured["queue"] = name
+
+        def enqueue(self, function, job_id, **kwargs):
+            captured.update(function=function, job_id=job_id, **kwargs)
+
+    monkeypatch.setattr(queue.Redis, "from_url", lambda *_a, **_k: _Connection())
+    monkeypatch.setattr(queue, "Queue", _Queue)
+    settings = get_settings().model_copy(update={
+        "practice_generation_max_wall_seconds": 600,
+        "practice_grading_max_wall_seconds": 180,
+    })
+
+    queue.enqueue_practice_job(settings, "job-1")
+
+    assert captured["job_timeout"] == 660
+    assert captured["function"] == "learn_platform_api.practice_workers.run_practice_job"
+    assert captured["closed"] is True

@@ -53,12 +53,16 @@ class Settings(BaseSettings):
     practice_generation_max_provider_calls: int = Field(default=4, ge=1)
     practice_generation_max_attempt_steps: int = Field(default=12, ge=1)
     practice_generation_max_evidence_tokens: int = Field(default=24_000, gt=0)
+    # Per provider call. The attempt-wide ceiling is enforced by the separate
+    # provider-call budget; reusing this value as a cumulative post-call limit
+    # discards output that has already been paid for.
     practice_generation_max_output_tokens: int = Field(default=12_000, gt=0)
     practice_generation_search_top_k: int = Field(default=5, gt=0, le=5)
     practice_generation_timeout_seconds: float = Field(default=180.0, gt=0)
     practice_generation_max_wall_seconds: int = Field(default=600, gt=0)
     practice_grading_max_provider_calls: int = Field(default=2, ge=1)
     practice_grading_max_evidence_tokens: int = Field(default=12_000, gt=0)
+    # Per provider call; practice_grading_max_provider_calls bounds the attempt.
     practice_grading_max_output_tokens: int = Field(default=3_000, gt=0)
     practice_grading_timeout_seconds: float = Field(default=60.0, gt=0)
     practice_grading_max_wall_seconds: int = Field(default=180, gt=0)

@@ -12,6 +12,7 @@ import hashlib
 import json
 import time
 from typing import Any
+from xml.etree import ElementTree
 
 from sqlalchemy.orm import Session
 
@@ -57,6 +58,52 @@ def parse_science_text_content(raw_text: str) -> dict[str, Any]:
         parsed.pop("prompt", None)
         return parsed
     return {"value": parsed}
+
+
+def science_observation_verification_outcome(
+    observation: dict[str, Any] | None,
+) -> str:
+    """Classify a bounded Wolfram observation without exposing its contents."""
+    if not isinstance(observation, dict):
+        return "missing"
+    if observation.get("verified") is True or observation.get("equivalent") is True:
+        return "verified"
+    if str(observation.get("result", "")).strip().casefold() == "true":
+        return "verified"
+    raw_text = observation.get("text")
+    if not isinstance(raw_text, str) or not raw_text.strip():
+        return "unrecognized"
+    try:
+        root = ElementTree.fromstring(raw_text.strip())
+    except ElementTree.ParseError:
+        return "invalid_envelope"
+    if root.tag != "result":
+        return "invalid_envelope"
+    lines = [line.strip() for line in "".join(root.itertext()).splitlines()]
+    for index, line in enumerate(lines):
+        if line.casefold() != "# result":
+            continue
+        values: list[str] = []
+        for candidate in lines[index + 1:]:
+            if candidate.startswith("#"):
+                break
+            if candidate:
+                values.append(candidate)
+        if len(values) != 1:
+            return "ambiguous_result"
+        return "verified" if values[0].casefold() == "true" else "not_verified"
+    return "result_missing"
+
+
+def science_observation_is_verified(observation: dict[str, Any] | None) -> bool:
+    """Interpret only explicit true results from the bounded Wolfram contract.
+
+    The hosted MCP currently returns a ``<result>`` text envelope rather than a
+    JSON ``result`` field. Parse that envelope structurally and require the
+    dedicated ``# Result`` section to be exactly ``True``; never accept a
+    substring from the echoed query or explanatory text.
+    """
+    return science_observation_verification_outcome(observation) == "verified"
 
 
 class ScienceToolResult:

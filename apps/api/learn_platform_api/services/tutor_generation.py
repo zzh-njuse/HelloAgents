@@ -14,6 +14,7 @@ from academic_companion.tutor_agents import TutorAnswerArtifact, answer_prompt, 
 from learn_platform_api.db.models import AgentRun, AgentToolCall, CodeLabRun, Course, CourseVersionSource, DocumentChunk, DocumentVersion, LearningMemory, LearningMemoryPolicy, LearningTarget, Lesson, LessonCitation, LessonCompletion, LessonVersion, MasteryState, SourceDocument, TutorSession, TutorTurn, TutorTurnCitation, TutorTurnCodeRun, TutorTurnToolAuthorization, Weakness, Workspace
 from learn_platform_api.services.course_generation import call_provider
 from learn_platform_api.services.provider_call_recorder import record_provider_call, TUTOR_PHASES
+from learn_platform_api.services.remote_tool_call_recorder import RemoteToolCallRecorder
 from learn_platform_api.services.retrieval import retrieve
 from learn_platform_api.settings import Settings
 
@@ -836,21 +837,31 @@ def _execute_science_tool_call(
     if not settings.wolfram_mcp_enabled:
         return None
 
-    from learn_platform_api.services.science_tool_service import (
-        normalize_science_arguments,
-        parse_science_text_content,
-    )
-
-    # Increment authorization usage BEFORE the call (send = consume)
-    auth.used_calls += 1
-    db.flush()
-
     try:
+        from learn_platform_api.services.science_tool_service import (
+            normalize_science_arguments,
+            parse_science_text_content,
+        )
         from mcp.client.streamable_http import streamable_http_client
         from mcp.types import CallToolResult, TextContent
         from shared.mcp_execution_contract import compute_canonical_hash as _compute_schema_hash
     except ImportError:
         return None
+
+    tool_ordinal = next_ordinal()
+    tool_recorder = RemoteToolCallRecorder(
+        db,
+        workspace_id=turn.workspace_id,
+        agent_run_id=run.id,
+        authorization_kind="tutor_turn",
+        authorization_id=auth.id,
+        capability_id="science_computation",
+        tool_name=f"McpScienceTool:{request.tool}",
+        ordinal=tool_ordinal,
+        input_hash=hashlib.sha256(request.tool.encode()).hexdigest()[:16],
+    )
+    tool_recorder.reserve()
+    db.expire(auth, ["used_calls"])
 
     url = settings.wolfram_mcp_url.rstrip("/")
     if not url.endswith("/mcp"):
@@ -996,25 +1007,16 @@ def _execute_science_tool_call(
     # didn't match, schema_drift was returned. Either way, the snapshot
     # is immutable for the lifetime of this Turn.
 
-    latency_ms = round((time.perf_counter() - started_at) * 1000)
-
-    # Write AgentToolCall with safe metadata only
-    db.add(AgentToolCall(
-        agent_run_id=run.id,
-        workspace_id=turn.workspace_id,
-        tool_name=f"McpScienceTool:{request.tool}",
-        ordinal=next_ordinal(),
-        status="succeeded" if "error" not in observation else "failed",
-        input_hash=hashlib.sha256(request.tool.encode()).hexdigest()[:16],
-        result_count=0,
-        latency_ms=latency_ms,
-    ))
-
     # Bound the observation size
     observation_json = json.dumps(observation, ensure_ascii=False)
     if len(observation_json) > 4000:
         observation = {"error": "result_too_large"}
         observation_json = json.dumps(observation, ensure_ascii=False)
+
+    if "error" in observation:
+        tool_recorder.fail(error_code=observation.get("error"))
+    else:
+        tool_recorder.succeed(result_count=0)
 
     return observation
 
@@ -1047,30 +1049,30 @@ def _execute_code_tool_call(
     if not settings.mcp_execution_adapter_url:
         return None
 
-    # Increment authorization usage BEFORE the call (send = consume)
-    auth.used_calls += 1
-    db.flush()
-
-    _STABLE_ERRORS = frozenset({
-        "protocol_drift", "tool_not_found", "tool_not_allowed",
-        "tool_call_error", "empty_result", "non_json_result",
-        "mcp_connection_failed", "schema_drift", "result_too_large",
-        "capability_unavailable", "backend_not_configured",
-        "backend_unavailable", "invalid_tool_result",
-        "unrecognized_tool_error",
-    })
+    tool_ordinal = next_ordinal()
+    tool_recorder = RemoteToolCallRecorder(
+        db,
+        workspace_id=turn.workspace_id,
+        agent_run_id=run.id,
+        authorization_kind="tutor_turn",
+        authorization_id=auth.id,
+        capability_id="code_execution",
+        tool_name=f"McpCodeTool:{request.language}",
+        ordinal=tool_ordinal,
+        input_hash=hashlib.sha256(request.language.encode()).hexdigest()[:16],
+    )
+    tool_recorder.reserve()
+    db.expire(auth, ["used_calls"])
 
     try:
         from learn_platform_api.services.code_lab_execution import (
-            call_run_code_via_mcp,
             ExecutionMcpError,
             BackendUnavailableError,
             SchemaDriftError,
             InvalidToolResultError,
         )
-        import asyncio
 
-        request_id = f"tutor-{turn.id[:12]}-{run.id[:12]}-{next_ordinal()}"
+        request_id = f"tutor-{turn.id[:12]}-{run.id[:12]}-{tool_ordinal}"
 
         # Use the canonical sync wrapper
         from learn_platform_api.services.code_lab_execution import execute_code_run_sync
@@ -1101,19 +1103,7 @@ def _execute_code_tool_call(
         if len(observation_json) > 4000:
             safe_observation = {"error": "result_too_large"}
 
-        latency_ms = round((time.perf_counter() - started_at) * 1000)
-
-        # Write AgentToolCall with safe metadata only
-        db.add(AgentToolCall(
-            agent_run_id=run.id,
-            workspace_id=turn.workspace_id,
-            tool_name=f"McpCodeTool:{request.language}",
-            ordinal=next_ordinal(),
-            status="succeeded",
-            input_hash=hashlib.sha256(request.language.encode()).hexdigest()[:16],
-            result_count=0,
-            latency_ms=latency_ms,
-        ))
+        tool_recorder.succeed(result_count=0)
 
         return safe_observation
 
@@ -1129,19 +1119,7 @@ def _execute_code_tool_call(
         error_code = "mcp_connection_failed"
 
     # Infrastructure failure — return error observation
-    latency_ms = round((time.perf_counter() - started_at) * 1000)
-
-    db.add(AgentToolCall(
-        agent_run_id=run.id,
-        workspace_id=turn.workspace_id,
-        tool_name=f"McpCodeTool:{request.language}",
-        ordinal=next_ordinal(),
-        status="failed",
-        input_hash=hashlib.sha256(request.language.encode()).hexdigest()[:16],
-        result_count=0,
-        latency_ms=latency_ms,
-        error_code=error_code,
-    ))
+    tool_recorder.fail(error_code=error_code, result_count=0)
 
     return {"error": error_code}
 
@@ -1541,6 +1519,10 @@ def execute_tutor_turn(db: Session, settings: Settings, turn: TutorTurn, *, work
         raise ValueError("generation_canceled")
     run = AgentRun(tutor_turn_id=turn.id, workspace_id=turn.workspace_id, role="tutor", attempt_number=turn.attempt_number, status="running")
     db.add(run); db.flush()
+    # ADR 004 S5.1: commit the minimal owner before any provider request
+    # so the independent recorder session can reference it. This commits only
+    # the AgentRun (no answers, lessons, practice, evidence or other half-products).
+    db.commit()
     # Slice 3 new turns carry a teaching-skill snapshot and run the skill path;
     # historical (pre-Slice-3) turns have a NULL snapshot and retry on the
     # legacy baseline path, never silently upgraded (Spec 003 §5.6, ADR 005 §3.6).

@@ -1,0 +1,48 @@
+{
+  "schema_version": "stage5_remote_gate_v1",
+  "layer": "real_remote",
+  "controlled_backend": false,
+  "remote_not_run": false,
+  "started_at": "2026-07-30T10:13:40.817193+00:00",
+  "updated_at": "2026-07-30T10:20:12.203232+00:00",
+  "record_count": 1,
+  "summary": {
+    "remote-practice-coding-cpp": {
+      "total": 1,
+      "succeeded": 0,
+      "failed": 1
+    }
+  },
+  "records": [
+    {
+      "sample_id": "remote-practice-coding-cpp",
+      "capability": "practice_coding",
+      "language": "cpp",
+      "mode": "require_coding",
+      "requested_item_count": 1,
+      "final_item_count": null,
+      "repetition": 1,
+      "tool_expectation": "required",
+      "tool_authorized": true,
+      "tool_called": false,
+      "tool_succeeded": false,
+      "provider_call_count": 3,
+      "provider_succeeded_count": 3,
+      "provider_failed_count": 0,
+      "repair_count": 1,
+      "mcp_call_count": 0,
+      "input_tokens": 9244,
+      "output_tokens": 10643,
+      "known_cost_cny": null,
+      "unknown_cost_call_count": 3,
+      "agent_run_count": 1,
+      "latency_ms": 391343,
+      "final_status": "failed",
+      "failure_category": "coding_repair_revalidation_failed",
+      "business_error_category": "coding_repair_revalidation_failed",
+      "layer": "real_remote",
+      "controlled_backend": false,
+      "remote_not_run": false
+    }
+  ]
+}

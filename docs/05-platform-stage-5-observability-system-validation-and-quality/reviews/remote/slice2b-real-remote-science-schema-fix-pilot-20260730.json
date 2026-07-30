@@ -1,0 +1,83 @@
+{
+  "schema_version": "stage5_remote_gate_v1",
+  "layer": "real_remote",
+  "controlled_backend": false,
+  "remote_not_run": false,
+  "started_at": "2026-07-30T10:57:21.898106+00:00",
+  "updated_at": "2026-07-30T11:03:44.230967+00:00",
+  "record_count": 2,
+  "summary": {
+    "remote-practice-science-required": {
+      "total": 1,
+      "succeeded": 0,
+      "failed": 1
+    },
+    "remote-practice-science-negative": {
+      "total": 1,
+      "succeeded": 1,
+      "failed": 0
+    }
+  },
+  "records": [
+    {
+      "sample_id": "remote-practice-science-required",
+      "capability": "practice_science",
+      "language": null,
+      "mode": "require_science",
+      "requested_item_count": 1,
+      "final_item_count": null,
+      "repetition": 1,
+      "tool_expectation": "required",
+      "tool_authorized": true,
+      "tool_called": false,
+      "tool_succeeded": false,
+      "provider_call_count": 3,
+      "provider_succeeded_count": 3,
+      "provider_failed_count": 0,
+      "repair_count": 1,
+      "mcp_call_count": 0,
+      "input_tokens": 8591,
+      "output_tokens": 5404,
+      "known_cost_cny": null,
+      "unknown_cost_call_count": 3,
+      "agent_run_count": 1,
+      "latency_ms": 319764,
+      "final_status": "failed",
+      "failure_category": "scientific_repair_revalidation_failed",
+      "business_error_category": "scientific_repair_revalidation_failed",
+      "layer": "real_remote",
+      "controlled_backend": false,
+      "remote_not_run": false
+    },
+    {
+      "sample_id": "remote-practice-science-negative",
+      "capability": "practice_general",
+      "language": null,
+      "mode": "general_only",
+      "requested_item_count": 1,
+      "final_item_count": 1,
+      "repetition": 1,
+      "tool_expectation": "forbidden",
+      "tool_authorized": true,
+      "tool_called": false,
+      "tool_succeeded": false,
+      "provider_call_count": 2,
+      "provider_succeeded_count": 2,
+      "provider_failed_count": 0,
+      "repair_count": 0,
+      "mcp_call_count": 0,
+      "input_tokens": 6803,
+      "output_tokens": 2334,
+      "known_cost_cny": null,
+      "unknown_cost_call_count": 2,
+      "agent_run_count": 1,
+      "latency_ms": 62500,
+      "final_status": "succeeded",
+      "failure_category": "none",
+      "business_error_category": "none",
+      "layer": "real_remote",
+      "controlled_backend": false,
+      "remote_not_run": false
+    }
+  ]
+}

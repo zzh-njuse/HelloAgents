@@ -29,7 +29,7 @@ from uuid import uuid4
 
 import httpx
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from learn_platform_api.db.models import (
     AgentRun,
@@ -49,6 +49,13 @@ from learn_platform_api.services.provider_call_recorder import (
     GENERATION_CANCELED,
     UNKNOWN_ERROR,
 )
+
+
+# --- ADR 004 helper: get the test session factory from the fixture ---------------
+
+def _sf(db_session):
+    """Return the test session factory for independent recorder sessions."""
+    return getattr(db_session, '_test_session_factory', None)
 
 
 # --- seed helpers ---------------------------------------------------------------
@@ -74,6 +81,9 @@ def _run(db_session, ws: Workspace) -> AgentRun:
     )
     db_session.add(ar)
     db_session.flush()
+    # ADR 004 S5.1: the owner must be committed so the independent recorder
+    # session can reference it as a FK target.
+    db_session.commit()
     return ar
 
 
@@ -84,6 +94,9 @@ def _trace(db_session, ws: Workspace) -> RagAnswerTrace:
     )
     db_session.add(t)
     db_session.flush()
+    # ADR 004 S5.1: the owner must be committed so the independent recorder
+    # session can reference it as a FK target.
+    db_session.commit()
     return t
 
 
@@ -961,3 +974,13 @@ def test_practice_call_practice_provider_empty_choices_via_real_helper(db_sessio
     assert len(calls) == 1
     assert calls[0].status == STATUS_FAILED
     assert calls[0].error_code == "provider_unavailable"
+
+
+# ============================================================================ #
+# Fix 3: Course lesson owner commit — replaced by acceptance test              #
+# ============================================================================ #
+# The old test_course_lesson_owner_commit_is_minimal manually replayed the
+# product's create-AgentRun/commit/create-authorization/rollback sequence
+# in the test, rather than calling the real _execute_lesson_generation().
+# It has been replaced by test_acceptance_evidence_course_owner.py which
+# calls the real service.

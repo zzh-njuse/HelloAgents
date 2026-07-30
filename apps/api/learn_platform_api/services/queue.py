@@ -66,7 +66,16 @@ def enqueue_practice_job(settings: Settings, job_id: str) -> None:
     connection = Redis.from_url(settings.redis_url)
     try:
         Queue(settings.practice_queue_name, connection=connection).enqueue(
-            "learn_platform_api.practice_workers.run_practice_job", job_id
+            "learn_platform_api.practice_workers.run_practice_job",
+            job_id,
+            # RQ defaults to 180 seconds, but one Practice generation may
+            # legitimately span several bounded provider/tool attempts. The
+            # worker's own wall budget remains authoritative; RQ only gets a
+            # small grace period to persist the controlled terminal state.
+            job_timeout=max(
+                settings.practice_generation_max_wall_seconds,
+                settings.practice_grading_max_wall_seconds,
+            ) + 60,
         )
     finally:
         connection.close()

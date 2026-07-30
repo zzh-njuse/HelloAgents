@@ -49,6 +49,7 @@ from academic_companion.practice_agents import (
     validate_feedback_citations,
     validate_practice_citations,
     CodingReferenceRepairArtifact,
+    RequiredScientificReferenceRepairArtifact,
     ScientificReferenceRepairArtifact,
 )
 from learn_platform_api.db.models import (
@@ -73,6 +74,10 @@ from learn_platform_api.db.models import (
 )
 from learn_platform_api.services.retrieval import retrieve
 from learn_platform_api.services.provider_call_recorder import record_provider_call, PRACTICE_GENERATION_PHASES, PRACTICE_GRADING_PHASES
+from learn_platform_api.services.remote_tool_call_recorder import (
+    RemoteToolCallRecorder,
+    TOOL_BUDGET_EXCEEDED,
+)
 from learn_platform_api.settings import Settings
 from learn_platform_api.services.practice_type_adaptation import (
     determine_suitability, validate_item_type_mode,
@@ -223,6 +228,28 @@ def call_practice_provider(settings: Settings, messages: list[dict[str, str]], m
         return json.loads(content), {"input_tokens": body.get("usage", {}).get("prompt_tokens"), "output_tokens": body.get("usage", {}).get("completion_tokens"), "finish_reason": body["choices"][0].get("finish_reason")}
     except (httpx.HTTPError, IndexError, KeyError, TypeError, json.JSONDecodeError) as exc:
         raise ValueError("provider_unavailable") from exc
+
+
+def _provider_output_exceeded(
+    generated: dict[str, Any],
+    usage: dict[str, Any],
+    max_tokens: int,
+) -> bool:
+    """Apply the configured output ceiling to one provider response.
+
+    ``max_tokens`` is sent to each provider request. Treating the same value as
+    an attempt-wide cumulative limit only rejects already-paid repair output;
+    provider-call and step budgets remain the authoritative attempt-wide caps.
+    """
+    if usage.get("finish_reason") == "length":
+        return True
+    reported = usage.get("output_tokens")
+    output_size = (
+        max(1, int(len(json.dumps(generated, ensure_ascii=False)) * 0.6))
+        if reported is None
+        else int(reported)
+    )
+    return output_size > max_tokens
 
 
 def _check_active(db: Session, job: PracticeJob, expected_worker_id: str, *, started: float, wall_limit: int, lease_lost=None, check_wall: bool = True) -> None:
@@ -412,10 +439,18 @@ def execute_generation(db: Session, settings: Settings, job: PracticeJob, *, wor
         allowed_item_types=allowed_types,
         code_languages=tuple(job.code_languages or ["python"]) if "coding" in allowed_types else (),
         prior_stems=tuple(prior_stems),
+        required_item_type=(
+            "coding" if item_type_mode == "require_coding"
+            else "scientific" if item_type_mode == "require_science"
+            else None
+        ),
     )
     run = AgentRun(practice_job_id=job.id, workspace_id=job.workspace_id, role="exercise_author", attempt_number=job.attempt_count, status="running")
     db.add(run)
     db.flush()
+    # ADR 004 S5.1: commit the minimal owner before any provider request
+    # so the independent recorder session can reference it.
+    db.commit()
     started = time.monotonic()
     ordinal = 0
     provider_calls = 0
@@ -424,7 +459,6 @@ def execute_generation(db: Session, settings: Settings, job: PracticeJob, *, wor
     output_total = 0
     input_missing = False
     output_missing = False
-    estimated_output = 0      # separate hard-budget estimate; never reported as provider usage
 
     def provider_step(messages: list[dict[str, str]], max_tokens: int, *, phase: str | None = None) -> tuple[dict[str, Any], float]:
         """Counted provider call (step + usage). Does NOT write a tool call: plan
@@ -433,7 +467,7 @@ def execute_generation(db: Session, settings: Settings, job: PracticeJob, *, wor
 
         The step is counted BEFORE the provider call so a failed attempt (e.g.
         provider_unavailable) is still reflected in run.step_count."""
-        nonlocal ordinal, provider_calls, input_total, output_total, input_missing, output_missing, estimated_output
+        nonlocal ordinal, provider_calls, input_total, output_total, input_missing, output_missing
         _check_active(db, job, worker_id, started=started, wall_limit=settings.practice_generation_max_wall_seconds, lease_lost=lease_lost)
         if ordinal >= settings.practice_generation_max_attempt_steps or provider_calls >= settings.practice_generation_max_provider_calls:
             raise ValueError("practice_budget_exceeded")
@@ -459,11 +493,9 @@ def execute_generation(db: Session, settings: Settings, job: PracticeJob, *, wor
             input_total += int(reported_in)
         if reported_out is None:
             output_missing = True
-            estimated_output += max(1, int(len(json.dumps(generated, ensure_ascii=False)) * 0.6))
         else:
             output_total += int(reported_out)
-            estimated_output += int(reported_out)
-        if usage.get("finish_reason") == "length" or estimated_output > settings.practice_generation_max_output_tokens:
+        if _provider_output_exceeded(generated, usage, max_tokens):
             raise ValueError("practice_budget_exceeded")
         _check_active(db, job, worker_id, started=started, wall_limit=settings.practice_generation_max_wall_seconds, lease_lost=lease_lost)
         return generated, phase_started
@@ -691,18 +723,41 @@ def execute_generation(db: Session, settings: Settings, job: PracticeJob, *, wor
     # BEFORE any Set/Item is persisted. If any required coding
     # reference fails, attempt one repair; if still fails, the
     # entire Job fails with zero Set/Item persisted.
-    def consume_tool_authorization(capability_id: str) -> JobToolAuthorization:
+    def reserve_remote_tool(
+        capability_id: str,
+        *,
+        tool_name: str,
+        input_hash: str | None,
+    ) -> tuple[JobToolAuthorization, RemoteToolCallRecorder]:
         nonlocal ordinal
         auth = authorizations.get(capability_id)
-        if auth is None or auth.used_calls >= auth.max_calls:
+        if auth is None:
             raise ValueError(f"{capability_id}_budget_exceeded")
         if ordinal >= settings.practice_generation_max_attempt_steps:
             raise ValueError("practice_budget_exceeded")
-        auth.used_calls += 1
         ordinal += 1
         run.step_count = ordinal
-        db.flush()
-        return auth
+        recorder = RemoteToolCallRecorder(
+            db,
+            workspace_id=job.workspace_id,
+            agent_run_id=run.id,
+            authorization_kind="job",
+            authorization_id=auth.id,
+            capability_id=capability_id,
+            tool_name=tool_name,
+            ordinal=ordinal,
+            input_hash=input_hash,
+        )
+        try:
+            recorder.reserve()
+        except ValueError as exc:
+            if str(exc) == TOOL_BUDGET_EXCEEDED:
+                raise ValueError(f"{capability_id}_budget_exceeded") from exc
+            raise
+        db.expire(auth, ["used_calls"])
+        return auth, recorder
+
+    coding_failure_summaries: dict[str, str] = {}
 
     def validate_coding_items(candidate: PracticeSetArtifact, phase: str) -> list[tuple[str, str, str]]:
         """Return ``(item_key, stable_error_code, repair_category)`` for each
@@ -711,6 +766,38 @@ def execute_generation(db: Session, settings: Settings, job: PracticeJob, *, wor
         failures: list[tuple[str, str, str]] = []
         for coding_item_artifact in (it for it in candidate.items if it.item_type == "coding"):
             _check_active(db, job, worker_id, started=started, wall_limit=settings.practice_generation_max_wall_seconds, lease_lost=lease_lost)
+            # A recovered specialized placeholder may intentionally bypass the
+            # Pydantic item validator so its mutable reference fields can be
+            # repaired. Detect canonical source-contract failures before
+            # invoking the execution backend; immutable schema failures remain
+            # whole-artifact failures and must not be disguised as reference
+            # repair.
+            try:
+                PracticeItemArtifact.model_validate(
+                    coding_item_artifact.model_dump(mode="json")
+                )
+            except ValidationError as exc:
+                messages = [
+                    str(issue.get("msg") or "")
+                    for issue in exc.errors()[:12]
+                ]
+                repairable_source_contract = any(
+                    any(marker in message for marker in (
+                        "python coding sources",
+                        "java coding sources",
+                        "cpp coding sources",
+                        "starter_code must not",
+                    ))
+                    for message in messages
+                )
+                if repairable_source_contract:
+                    failures.append((
+                        coding_item_artifact.item_key,
+                        "coding_contract_invalid",
+                        "source_contract",
+                    ))
+                    continue
+                raise ValueError("practice_artifact_schema_invalid") from exc
             reference_solution = coding_item_artifact.reference_solution or ""
             hidden_tests_raw = list(coding_item_artifact.public_examples or []) + list(coding_item_artifact.hidden_tests or [])
             language = coding_item_artifact.language or "python"
@@ -723,32 +810,46 @@ def execute_generation(db: Session, settings: Settings, job: PracticeJob, *, wor
             # Convert CodingTestCase to dict for _validate_coding_reference_via_mcp
             hidden_tests = [tc.model_dump() for tc in hidden_tests_raw]
 
-            call_started = time.perf_counter()
-            consume_tool_authorization("code_execution")
-            validation = _validate_coding_reference_via_mcp(
-                reference_solution=reference_solution,
-                hidden_tests=hidden_tests,
-                language=language,
-                settings=settings,
-                request_id_prefix=f"ref-{phase}-{job.id[:12]}-{item_key}",
-                harness_version=harness_version,
+            _, tool_recorder = reserve_remote_tool(
+                "code_execution",
+                tool_name="ValidateCodingReference",
+                input_hash=hashlib.sha256(language.encode()).hexdigest()[:16],
             )
+            try:
+                validation = _validate_coding_reference_via_mcp(
+                    reference_solution=reference_solution,
+                    hidden_tests=hidden_tests,
+                    language=language,
+                    settings=settings,
+                    request_id_prefix=f"ref-{phase}-{job.id[:12]}-{item_key}",
+                    harness_version=harness_version,
+                )
+            except Exception:
+                tool_recorder.fail(error_code="code_execution_unavailable")
+                raise
 
             if validation.infrastructure_failure:
-                _tool_call(db, run, "ValidateCodingReference", ordinal, None, None, call_started, "failed", "infrastructure_failure")
+                tool_recorder.fail(error_code="code_execution_unavailable")
                 raise ValueError("code_execution_unavailable")
 
             if not validation.passed:
                 raw_categories = ",".join(validation.error_categories) or "test_mismatch"
                 code, category = _coding_reference_stable_code(raw_categories)
-                _tool_call(db, run, "ValidateCodingReference", ordinal, None, validation.tests_passed, call_started, "failed", "reference_failed_tests")
+                coding_failure_summaries[item_key] = _build_safe_position_summary(
+                    language=language,
+                    validation_result=validation,
+                )
+                tool_recorder.fail(
+                    error_code="invalid_tool_result",
+                    result_count=validation.tests_passed,
+                )
                 failures.append((item_key, code, category))
                 logger.warning(
                     "coding reference validation failed for job %s item_key %s: %d/%d tests passed",
                     job.id, item_key, validation.tests_passed, validation.tests_total,
                 )
             else:
-                _tool_call(db, run, "ValidateCodingReference", ordinal, None, validation.tests_passed, call_started)
+                tool_recorder.succeed(result_count=validation.tests_passed)
 
             # A starter is a scaffold, not a second solution.  Validate this
             # behaviorally instead of relying on textual similarity: if the
@@ -758,24 +859,38 @@ def execute_generation(db: Session, settings: Settings, job: PracticeJob, *, wor
             # that failure adds no useful evidence and can mislabel a content
             # failure as an infrastructure failure if the second call flakes.
             if starter_code and validation.passed:
-                starter_started = time.perf_counter()
-                consume_tool_authorization("code_execution")
-                starter_validation = _validate_coding_reference_via_mcp(
-                    reference_solution=starter_code,
-                    hidden_tests=hidden_tests,
-                    language=language,
-                    settings=settings,
-                    request_id_prefix=f"starter-{phase}-{job.id[:12]}-{item_key}",
-                    harness_version=harness_version,
+                _, starter_recorder = reserve_remote_tool(
+                    "code_execution",
+                    tool_name="ValidateCodingStarter",
+                    input_hash=hashlib.sha256(language.encode()).hexdigest()[:16],
                 )
+                try:
+                    starter_validation = _validate_coding_reference_via_mcp(
+                        reference_solution=starter_code,
+                        hidden_tests=hidden_tests,
+                        language=language,
+                        settings=settings,
+                        request_id_prefix=f"starter-{phase}-{job.id[:12]}-{item_key}",
+                        harness_version=harness_version,
+                    )
+                except Exception:
+                    starter_recorder.fail(
+                        error_code="code_execution_unavailable"
+                    )
+                    raise
                 if starter_validation.infrastructure_failure:
-                    _tool_call(db, run, "ValidateCodingStarter", ordinal, None, None, starter_started, "failed", "infrastructure_failure")
+                    starter_recorder.fail(error_code="code_execution_unavailable")
                     raise ValueError("code_execution_unavailable")
                 if starter_validation.passed:
-                    _tool_call(db, run, "ValidateCodingStarter", ordinal, None, starter_validation.tests_passed, starter_started, "failed", "starter_reveals_solution")
+                    starter_recorder.fail(
+                        error_code="invalid_tool_result",
+                        result_count=starter_validation.tests_passed,
+                    )
                     failures.append((item_key, "coding_starter_invalid", "starter_reveals_solution"))
                 else:
-                    _tool_call(db, run, "ValidateCodingStarter", ordinal, None, starter_validation.tests_passed, starter_started)
+                    starter_recorder.succeed(
+                        result_count=starter_validation.tests_passed
+                    )
         return failures
 
     def validate_scientific_items(candidate: PracticeSetArtifact) -> list[tuple[str, str, str]]:
@@ -783,7 +898,10 @@ def execute_generation(db: Session, settings: Settings, job: PracticeJob, *, wor
         scientific item whose remote verification was insufficient. Items that
         do not need remote verification pass locally. Infrastructure failures
         raise ``science_tool_unavailable`` (delivery-retryable)."""
-        from learn_platform_api.services.science_tool_service import execute_science_verification
+        from learn_platform_api.services.science_tool_service import (
+            execute_science_verification,
+            science_observation_verification_outcome,
+        )
 
         failures: list[tuple[str, str, str]] = []
         for scientific_item in (it for it in candidate.items if it.item_type == "scientific"):
@@ -803,27 +921,57 @@ def execute_generation(db: Session, settings: Settings, job: PracticeJob, *, wor
                 # persisting a broken item.
                 failures.append((scientific_item.item_key, "scientific_spec_missing", "spec_missing"))
                 continue
+            if item_type_mode == "require_science" and not spec.needs_remote_verification:
+                # ``require_science`` is an explicit request for a scientific
+                # item backed by the authorized verifier, not merely a numeric
+                # short answer with a different label. Route a locally claimed
+                # answer through the one bounded specialized repair so the
+                # provider supplies a verification expression, then verify it.
+                failures.append((
+                    scientific_item.item_key,
+                    "scientific_reference_unverified",
+                    "remote_verification_required",
+                ))
+                continue
             if not spec.needs_remote_verification:
                 continue
-            auth = consume_tool_authorization("science_computation")
-            call_started = time.perf_counter()
-            result = execute_science_verification(
-                tool="WolframAlpha",
-                arguments={"query": spec.verification_expression},
-                settings=settings,
-                expected_schema_hash=auth.schema_hash_snapshot,
+            auth, tool_recorder = reserve_remote_tool(
+                "science_computation",
+                tool_name="VerifyScientificAnswer",
+                input_hash=hashlib.sha256(
+                    b"WolframAlpha:scientific_answer"
+                ).hexdigest()[:16],
             )
+            try:
+                result = execute_science_verification(
+                    tool="WolframAlpha",
+                    arguments={"query": spec.verification_expression},
+                    settings=settings,
+                    expected_schema_hash=auth.schema_hash_snapshot,
+                )
+            except Exception:
+                tool_recorder.fail(error_code="science_tool_unavailable")
+                raise
             _check_active(db, job, worker_id, started=started, wall_limit=settings.practice_generation_max_wall_seconds, lease_lost=lease_lost)
-            observation = result.observation or {}
-            verified = observation.get("verified") is True or observation.get("equivalent") is True or str(observation.get("result", "")).strip().casefold() == "true"
+            verification_outcome = science_observation_verification_outcome(
+                result.observation
+            )
+            verified = verification_outcome == "verified"
+            logger.info(
+                "scientific verification completed job=%s outcome=%s",
+                job.id,
+                verification_outcome,
+            )
             if not result.success:
-                _tool_call(db, run, "VerifyScientificAnswer", ordinal, None, None, call_started, "failed", result.error_code or "science_tool_unavailable")
+                tool_recorder.fail(
+                    error_code=result.error_code or "science_tool_unavailable"
+                )
                 raise ValueError("science_tool_unavailable")
             if not verified:
-                _tool_call(db, run, "VerifyScientificAnswer", ordinal, None, None, call_started, "failed", result.error_code or "answer_not_verified")
+                tool_recorder.fail(error_code="invalid_tool_result")
                 failures.append((scientific_item.item_key, "scientific_reference_unverified", "science_unverified"))
             else:
-                _tool_call(db, run, "VerifyScientificAnswer", ordinal, None, 1, call_started)
+                tool_recorder.succeed(result_count=1)
         return failures
 
     harness_version = harness_for_artifact(job.artifact_contract_version)
@@ -845,19 +993,21 @@ def execute_generation(db: Session, settings: Settings, job: PracticeJob, *, wor
         # that caused the failure, not from ad-hoc string concatenation.
         safe_summary = None
         if failed_item.item_type == "coding":
-            # Reconstruct a CodingReferenceValidationResult-like summary from
-            # the failure category. We don't have the original validation result
-            # here, so we build the summary from the stable category and language.
-            safe_summary = _build_safe_position_summary(
-                language=getattr(failed_item, "language", "python"),
-                validation_result=CodingReferenceValidationResult(
-                    passed=False,
-                    tests_passed=0,
-                    tests_total=0,
-                    error_categories=[category],
-                    infrastructure_failure=False,
-                ),
-            )
+            # Preserve the safe count/category summary from the actual failed
+            # execution. Reconstruct only for source-contract failures that
+            # were rejected before the execution backend was called.
+            safe_summary = coding_failure_summaries.get(item_key)
+            if safe_summary is None:
+                safe_summary = _build_safe_position_summary(
+                    language=getattr(failed_item, "language", "python"),
+                    validation_result=CodingReferenceValidationResult(
+                        passed=False,
+                        tests_passed=0,
+                        tests_total=0,
+                        error_categories=[category],
+                        infrastructure_failure=False,
+                    ),
+                )
 
         repaired_raw, repair_started = provider_step(
             build_specialized_item_repair_prompt(
@@ -882,7 +1032,12 @@ def execute_generation(db: Session, settings: Settings, job: PracticeJob, *, wor
                 # reference_solution and starter_code from the minimal DTO.
                 new_item = _merge_minimal_coding_repair(failed_item, repair_artifact)
             elif failed_item.item_type == "scientific":
-                repair_artifact = ScientificReferenceRepairArtifact.model_validate(repaired_raw)
+                repair_model = (
+                    RequiredScientificReferenceRepairArtifact
+                    if item_type_mode == "require_science"
+                    else ScientificReferenceRepairArtifact
+                )
+                repair_artifact = repair_model.model_validate(repaired_raw)
                 if repair_artifact.item_key != item_key:
                     raise ValueError("specialized repair changed item identity: item_key mismatch")
                 new_item = _merge_minimal_scientific_repair(failed_item, repair_artifact)
@@ -895,6 +1050,15 @@ def execute_generation(db: Session, settings: Settings, job: PracticeJob, *, wor
             repair_invalid_code = (
                 CODING_REPAIR_ARTIFACT_INVALID if failed_item.item_type == "coding"
                 else SCIENTIFIC_REPAIR_ARTIFCAT_INVALID
+            )
+            safe_diag = _safe_recovery_diagnostics(exc)
+            logger.warning(
+                "specialized repair artifact invalid job=%s item_type=%s count=%s diagnostics=%s truncated=%s",
+                job.id,
+                failed_item.item_type,
+                safe_diag["validation_error_count"],
+                safe_diag["diagnostics"],
+                safe_diag["truncated"],
             )
             _tool_call(db, run, "RepairSpecializedItem", ordinal, None, None, repair_started, "failed", repair_invalid_code)
             # Correction 002 §D: propagate the stable repair-invalid code to the Job,
@@ -913,12 +1077,16 @@ def execute_generation(db: Session, settings: Settings, job: PracticeJob, *, wor
                 CODING_REPAIR_REVALIDATION_FAILED if merged_item.item_type == "coding"
                 else SCIENTIFIC_REPAIR_REVALIDATION_FAILED
             )
+            ordinal += 1
+            run.step_count = ordinal
             _tool_call(db, run, "RepairSpecializedItem", ordinal, None, None, repair_started, "failed", reval_code)
             # Correction 002 §D: propagate the stable revalidation-failed code to the Job,
             # NOT the original user_code (coding_reference_test_failed).
             raise ValueError(reval_code)
         # Substitute only the repaired item; every other item/citation is untouched.
         artifact = PracticeSetArtifact(items=[merged_item if it.item_key == item_key else it for it in artifact.items])
+        ordinal += 1
+        run.step_count = ordinal
         _tool_call(db, run, "RepairSpecializedItem", ordinal, None, 1, repair_started, "succeeded")
         # Re-validate the complete Set after specialized repair to ensure
         # item count, requested types, citations, targets, and formula
@@ -2203,6 +2371,9 @@ def execute_grading(db: Session, settings: Settings, job: PracticeJob, *, worker
         run = AgentRun(practice_job_id=job.id, workspace_id=job.workspace_id, role="answer_grader", attempt_number=job.attempt_count, status="running")
         db.add(run)
         db.flush()
+        # ADR 004 S5.1: commit the minimal owner before any provider request
+        # so the independent recorder session can reference it.
+        db.commit()
         started = time.monotonic()
         ordinal = 1
         run.step_count = ordinal
@@ -2211,15 +2382,32 @@ def execute_grading(db: Session, settings: Settings, job: PracticeJob, *, worker
             JobToolAuthorization.practice_job_id == job.id,
             JobToolAuthorization.capability_id == "code_execution",
         ))
-        if auth is None or auth.used_calls >= auth.max_calls:
+        if auth is None:
             raise ValueError("code_execution_not_authorized")
         _check_active(db, job, worker_id, started=grading_started, wall_limit=settings.practice_grading_max_wall_seconds, lease_lost=lease_lost)
-        auth.used_calls += 1
-        db.flush()
+        tool_recorder = RemoteToolCallRecorder(
+            db,
+            workspace_id=job.workspace_id,
+            agent_run_id=run.id,
+            authorization_kind="job",
+            authorization_id=auth.id,
+            capability_id="code_execution",
+            tool_name="CodeExecution",
+            ordinal=ordinal,
+            input_hash=hashlib.sha256(
+                str(answer_spec.get("language") or "").encode()
+            ).hexdigest()[:16],
+        )
+        try:
+            tool_recorder.reserve()
+        except ValueError as exc:
+            if str(exc) == TOOL_BUDGET_EXCEEDED:
+                raise ValueError("grading_budget_exceeded") from exc
+            raise ValueError("code_execution_not_authorized") from exc
+        db.expire(auth, ["used_calls"])
 
         # Per Spec 004 §6.3: score is deterministic from test weights,
         # LLM cannot modify it. Infrastructure failure is Job failure.
-        tool_started = time.perf_counter()
         try:
             coding_result = execute_coding_grading(
                 source_code=source_code,
@@ -2228,11 +2416,11 @@ def execute_grading(db: Session, settings: Settings, job: PracticeJob, *, worker
                 request_id_prefix=f"grade-{job.id[:12]}-{attempt.id[:12]}",
             )
         except ExecutionMcpError:
-            _tool_call(db, run, "CodeExecution", ordinal, None, None, tool_started, "failed", "code_execution_unavailable")
+            tool_recorder.fail(error_code="code_execution_unavailable")
             # Per Spec 004 §6.3: infrastructure failure is Job failure,
             # NOT 0 score or fake feedback.
             raise ValueError("coding_grading_infrastructure_failure")
-        _tool_call(db, run, "CodeExecution", ordinal, None, 1, tool_started, "succeeded")
+        tool_recorder.succeed(result_count=1)
 
         # LLM is used ONLY for teaching feedback (explanation/improvement),
         # NOT to modify the score. The score is already deterministic.
@@ -2241,10 +2429,9 @@ def execute_grading(db: Session, settings: Settings, job: PracticeJob, *, worker
         output_total = 0
         input_missing = False
         output_missing = False
-        estimated_output = 0
 
         def provider_step(messages: list[dict[str, str]], *, phase: str | None = None) -> tuple[dict[str, Any], float]:
-            nonlocal ordinal, provider_calls, input_total, output_total, input_missing, output_missing, estimated_output
+            nonlocal ordinal, provider_calls, input_total, output_total, input_missing, output_missing
             _check_active(db, job, worker_id, started=started, wall_limit=settings.practice_grading_max_wall_seconds, lease_lost=lease_lost)
             if provider_calls >= settings.practice_grading_max_provider_calls:
                 raise ValueError("grading_budget_exceeded")
@@ -2270,11 +2457,9 @@ def execute_grading(db: Session, settings: Settings, job: PracticeJob, *, worker
                 input_total += int(reported_in)
             if reported_out is None:
                 output_missing = True
-                estimated_output += max(1, int(len(json.dumps(generated, ensure_ascii=False)) * 0.6))
             else:
                 output_total += int(reported_out)
-                estimated_output += int(reported_out)
-            if usage.get("finish_reason") == "length" or estimated_output > settings.practice_grading_max_output_tokens:
+            if _provider_output_exceeded(generated, usage, settings.practice_grading_max_output_tokens):
                 raise ValueError("grading_budget_exceeded")
             _check_active(db, job, worker_id, started=started, wall_limit=settings.practice_grading_max_wall_seconds, lease_lost=lease_lost)
             return generated, phase_started
@@ -2426,32 +2611,66 @@ def execute_grading(db: Session, settings: Settings, job: PracticeJob, *, worker
                 JobToolAuthorization.practice_job_id == job.id,
                 JobToolAuthorization.capability_id == "science_computation",
             ))
-            if auth is None or auth.used_calls >= auth.max_calls:
+            if auth is None:
                 science_status = "unauthorized"
             else:
                 from learn_platform_api.services.science_tool_service import execute_science_verification
                 _check_active(db, job, worker_id, started=grading_started, wall_limit=settings.practice_grading_max_wall_seconds, lease_lost=lease_lost)
-                call_started = time.perf_counter()
-                auth.used_calls += 1
                 science_run.step_count = 1
-                db.flush()
-                result = execute_science_verification(
-                    tool="WolframAlpha",
-                    arguments={"query": f"equivalent({submitted},{expected})"[:500]},
-                    settings=settings,
-                    expected_schema_hash=auth.schema_hash_snapshot,
+                # The independent recorder must be able to reference its owner.
+                db.commit()
+                tool_recorder = RemoteToolCallRecorder(
+                    db,
+                    workspace_id=job.workspace_id,
+                    agent_run_id=science_run.id,
+                    authorization_kind="job",
+                    authorization_id=auth.id,
+                    capability_id="science_computation",
+                    tool_name="VerifyScientificAttempt",
+                    ordinal=1,
+                    input_hash=hashlib.sha256(
+                        b"WolframAlpha:scientific_attempt"
+                    ).hexdigest()[:16],
                 )
-                if not result.success:
-                    _tool_call(db, science_run, "VerifyScientificAttempt", 1, None, None, call_started, "failed", result.error_code or "science_tool_unavailable")
+                try:
+                    tool_recorder.reserve()
+                except ValueError as exc:
+                    if str(exc) == TOOL_BUDGET_EXCEEDED:
+                        raise ValueError("grading_budget_exceeded") from exc
+                    science_status = "unauthorized"
+                    tool_recorder = None
+                if tool_recorder is not None:
+                    db.expire(auth, ["used_calls"])
+                    try:
+                        result = execute_science_verification(
+                            tool="WolframAlpha",
+                            arguments={"query": f"equivalent({submitted},{expected})"[:500]},
+                            settings=settings,
+                            expected_schema_hash=auth.schema_hash_snapshot,
+                        )
+                    except Exception:
+                        tool_recorder.fail(
+                            error_code="science_tool_unavailable"
+                        )
+                        raise
+                else:
+                    result = None
+                if result is None:
+                    equivalent = None
+                elif not result.success:
+                    tool_recorder.fail(
+                        error_code=result.error_code
+                        or "science_tool_unavailable"
+                    )
                     science_status = "unavailable"
                 else:
                     observation = result.observation if isinstance(result.observation, dict) else {}
                     equivalent = observation.get("equivalent") if isinstance(observation.get("equivalent"), bool) else None
                     if equivalent is None:
-                        _tool_call(db, science_run, "VerifyScientificAttempt", 1, None, None, call_started, "failed", "insufficient_observation")
+                        tool_recorder.fail(error_code="invalid_tool_result")
                         science_status = "insufficient"
                     else:
-                        _tool_call(db, science_run, "VerifyScientificAttempt", 1, None, 1, call_started)
+                        tool_recorder.succeed(result_count=1)
                         science_status = "remote_verified"
 
         science_verification = {
@@ -2532,6 +2751,9 @@ def execute_grading(db: Session, settings: Settings, job: PracticeJob, *, worker
     if science_run is None:
         db.add(run)
         db.flush()
+        # ADR 004 S5.1: commit the minimal owner before any provider request
+        # so the independent recorder session can reference it.
+        db.commit()
     started = time.monotonic()
     ordinal = 1 if science_run and science_run.step_count else 0
     provider_calls = 0
@@ -2539,10 +2761,9 @@ def execute_grading(db: Session, settings: Settings, job: PracticeJob, *, worker
     output_total = 0
     input_missing = False
     output_missing = False
-    estimated_output = 0
 
     def provider_step(messages: list[dict[str, str]], *, phase: str | None = None) -> tuple[dict[str, Any], float]:
-        nonlocal ordinal, provider_calls, input_total, output_total, input_missing, output_missing, estimated_output
+        nonlocal ordinal, provider_calls, input_total, output_total, input_missing, output_missing
         _check_active(db, job, worker_id, started=started, wall_limit=settings.practice_grading_max_wall_seconds, lease_lost=lease_lost)
         if provider_calls >= settings.practice_grading_max_provider_calls:
             raise ValueError("grading_budget_exceeded")
@@ -2568,11 +2789,9 @@ def execute_grading(db: Session, settings: Settings, job: PracticeJob, *, worker
             input_total += int(reported_in)
         if reported_out is None:
             output_missing = True
-            estimated_output += max(1, int(len(json.dumps(generated, ensure_ascii=False)) * 0.6))
         else:
             output_total += int(reported_out)
-            estimated_output += int(reported_out)
-        if usage.get("finish_reason") == "length" or estimated_output > settings.practice_grading_max_output_tokens:
+        if _provider_output_exceeded(generated, usage, settings.practice_grading_max_output_tokens):
             raise ValueError("grading_budget_exceeded")
         _check_active(db, job, worker_id, started=started, wall_limit=settings.practice_grading_max_wall_seconds, lease_lost=lease_lost)
         return generated, phase_started

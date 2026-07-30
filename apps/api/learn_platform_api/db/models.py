@@ -517,9 +517,30 @@ class AgentRun(Base):
 
 class AgentToolCall(Base):
     __tablename__ = "agent_tool_calls"
+    __table_args__ = (
+        UniqueConstraint(
+            "agent_run_id",
+            "ordinal",
+            name="uq_agent_tool_calls_ordinal",
+        ),
+        CheckConstraint(
+            "status IN ('started','succeeded','failed','timed_out','canceled')",
+            name="ck_agent_tool_calls_status_valid",
+        ),
+        CheckConstraint(
+            "ordinal >= 0",
+            name="ck_agent_tool_calls_ordinal_nonneg",
+        ),
+        ForeignKeyConstraint(
+            ["agent_run_id", "workspace_id"],
+            ["agent_runs.id", "agent_runs.workspace_id"],
+            name="fk_agent_tool_calls_run_workspace",
+            ondelete="CASCADE",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
-    agent_run_id: Mapped[str] = mapped_column(ForeignKey("agent_runs.id"), index=True, nullable=False)
+    agent_run_id: Mapped[str] = mapped_column(String(36), index=True, nullable=False)
     workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True, nullable=False)
     tool_name: Mapped[str] = mapped_column(String(100), nullable=False)
     ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -988,7 +1009,13 @@ class CodeLabJob(Base):
 
 class TutorTurnToolAuthorization(Base):
     __tablename__ = "tutor_turn_tool_authorizations"
-    __table_args__ = (UniqueConstraint("turn_id", "capability_id", name="uq_tutor_turn_tool_auth_turn_capability"),)
+    __table_args__ = (
+        UniqueConstraint("turn_id", "capability_id", name="uq_tutor_turn_tool_auth_turn_capability"),
+        CheckConstraint(
+            "max_calls >= 0 AND used_calls >= 0 AND used_calls <= max_calls",
+            name="ck_tutor_turn_tool_auth_budget_valid",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     turn_id: Mapped[str] = mapped_column(ForeignKey("tutor_turns.id", ondelete="CASCADE"), index=True, nullable=False)
@@ -1075,6 +1102,10 @@ class JobToolAuthorization(Base):
             "((CASE WHEN course_generation_job_id IS NOT NULL THEN 1 ELSE 0 END) + "
             "(CASE WHEN practice_job_id IS NOT NULL THEN 1 ELSE 0 END)) = 1",
             name="ck_job_tool_auth_one_owner",
+        ),
+        CheckConstraint(
+            "max_calls >= 0 AND used_calls >= 0 AND used_calls <= max_calls",
+            name="ck_job_tool_auth_budget_valid",
         ),
         Index(
             "uq_job_tool_auth_course_cap",
